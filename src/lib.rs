@@ -578,25 +578,36 @@ fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
         // Symmetrize: union incoming + outgoing, then α-prune again (parallel)
         // Build incoming lists
         let mut incoming: Vec<Vec<u32>> = vec![Vec::new(); n];
-        for (u_pos, &u) in order.iter().enumerate() {
-            for &v in &new_graph[u_pos] {
+        for (pos, &u) in order.iter().enumerate() {
+            for &v in &new_graph[pos] {
                 incoming[v as usize].push(u as u32);
             }
         }
 
-        // Union + prune in parallel back to graph
+        // Build inverse map: node-id -> position in `order` (O(n))
+        let mut pos_of = vec![0usize; n];
+        for (pos, &u) in order.iter().enumerate() {
+            pos_of[u] = pos;
+        }
+
+        // Union + prune without O(n^2) lookup, and without HashSet per node
         graph = (0..n)
             .into_par_iter()
             .map(|u| {
-                let mut set = HashSet::new();
-                for &x in &new_graph[order.iter().position(|&x| x == u).unwrap()] {
-                    set.insert(x);
-                }
-                for &x in &incoming[u] {
-                    set.insert(x);
-                }
-                // Compute distances and prune
-                let pool: Vec<(u32, f32)> = set
+                // Union outgoing (from new_graph, indexed by pos_of[u]) + incoming[u]
+                let ng = &new_graph[pos_of[u]];     // O(1)
+                let inc = &incoming[u];
+
+                let mut pool_ids: Vec<u32> = Vec::with_capacity(ng.len() + inc.len());
+                pool_ids.extend_from_slice(ng);
+                pool_ids.extend_from_slice(inc);
+
+                // Deduplicate cheaply (degrees are small)
+                pool_ids.sort_unstable();
+                pool_ids.dedup();
+
+                // Compute distances once, then α-prune
+                let pool: Vec<(u32, f32)> = pool_ids
                     .into_iter()
                     .filter(|&id| id as usize != u)
                     .map(|id| (id, dist.eval(&vectors[u], &vectors[id as usize])))
