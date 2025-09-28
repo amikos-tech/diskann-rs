@@ -53,8 +53,8 @@ use thiserror::Error;
 const PAD_U32: u32 = u32::MAX;
 
 /// Defaults for in-memory DiskANN builds
-pub const DISKANN_DEFAULT_MAX_DEGREE: usize = 32;
-pub const DISKANN_DEFAULT_BUILD_BEAM: usize = 256;
+pub const DISKANN_DEFAULT_MAX_DEGREE: usize = 64;
+pub const DISKANN_DEFAULT_BUILD_BEAM: usize = 128;
 pub const DISKANN_DEFAULT_ALPHA: f32 = 1.2;
 
 /// Optional bag of knobs if you want to override just a few.
