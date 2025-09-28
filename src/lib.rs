@@ -576,37 +576,28 @@ fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
             .collect();
 
         // Symmetrize: union incoming + outgoing, then α-prune again (parallel)
-        // Build incoming lists
-        let mut incoming: Vec<Vec<u32>> = vec![Vec::new(); n];
-        for (pos, &u) in order.iter().enumerate() {
-            for &v in &new_graph[pos] {
-                incoming[v as usize].push(u as u32);
-            }
-        }
-
-        // Build inverse map: node-id -> position in `order` (O(n))
+        // Build inverse map: node-id -> position in `order`
         let mut pos_of = vec![0usize; n];
-        for (pos, &u) in order.iter().enumerate() {
-            pos_of[u] = pos;
-        }
+        for (pos, &u) in order.iter().enumerate() { pos_of[u] = pos; }
 
-        // Union + prune without O(n^2) lookup, and without HashSet per node
+        // Build incoming as CSR
+        let (incoming_flat, incoming_off) = build_incoming_csr(&order, &new_graph, n);
+
+        // Union + prune in parallel
         graph = (0..n)
             .into_par_iter()
             .map(|u| {
-                // Union outgoing (from new_graph, indexed by pos_of[u]) + incoming[u]
-                let ng = &new_graph[pos_of[u]];     // O(1)
-                let inc = &incoming[u];
+                let ng = &new_graph[pos_of[u]]; // outgoing from this pass
+                let inc = &incoming_flat[incoming_off[u]..incoming_off[u + 1]]; // incoming to u
 
+                // pool = union(outgoing ∪ incoming) with tiny, cache-friendly ops
                 let mut pool_ids: Vec<u32> = Vec::with_capacity(ng.len() + inc.len());
                 pool_ids.extend_from_slice(ng);
                 pool_ids.extend_from_slice(inc);
-
-                // Deduplicate cheaply (degrees are small)
                 pool_ids.sort_unstable();
                 pool_ids.dedup();
 
-                // Compute distances once, then α-prune
+                // compute distances once, then α-prune
                 let pool: Vec<(u32, f32)> = pool_ids
                     .into_iter()
                     .filter(|&id| id as usize != u)
@@ -743,6 +734,32 @@ fn prune_neighbors<D: Distance<f32> + Copy>(
     }
 
     pruned
+}
+
+fn build_incoming_csr(order: &[usize], new_graph: &[Vec<u32>], n: usize) -> (Vec<u32>, Vec<usize>) {
+    // 1) count in-degree per node
+    let mut indeg = vec![0usize; n];
+    for (pos, _u) in order.iter().enumerate() {
+        for &v in &new_graph[pos] {
+            indeg[v as usize] += 1;
+        }
+    }
+    // 2) prefix sums → offsets
+    let mut off = vec![0usize; n + 1];
+    for i in 0..n {
+        off[i + 1] = off[i] + indeg[i];
+    }
+    // 3) fill flat incoming list
+    let mut cur = off.clone();
+    let mut incoming_flat = vec![0u32; off[n]];
+    for (pos, &u) in order.iter().enumerate() {
+        for &v in &new_graph[pos] {
+            let idx = cur[v as usize];
+            incoming_flat[idx] = u as u32;
+            cur[v as usize] += 1;
+        }
+    }
+    (incoming_flat, off)
 }
 
 #[cfg(test)]
