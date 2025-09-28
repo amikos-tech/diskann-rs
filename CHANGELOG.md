@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.0] - 2025-09-23
+- BREAKING: parallelize build with Rayon
+- BREAKING: add support for generic trait distance via anndists
+- More examples and benchmarks using MNIST and SIFT datasets
+- Fix bug that leads to low recall
+
 ## [0.2.0] - 2025-01-03
 - BREAKING: Complete rewrite using proper Vamana graph algorithm
 - BREAKING: Renamed SingleFileDiskANN to DiskANN

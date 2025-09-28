@@ -15,7 +15,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 use std::time::{Duration, Instant};
-
+use rayon::prelude::*; 
 use anndists::dist::DistL2;
 use byteorder::{LittleEndian, ReadBytesExt};
 use diskann_rs::{DiskANN, DiskAnnParams};
@@ -219,26 +219,33 @@ fn eval_recall(
     k: usize,
     beam: usize,
 ) {
+
     assert_eq!(queries_f32.len(), gt.len());
-    // GT is squared L2; threshold is sqrt of kth distance
+
     let t0 = Instant::now();
-    let mut correct = 0usize;
 
-    for (qi, q) in queries_f32.iter().enumerate() {
-        let nns = index.search(q, k, beam);
+    // Parallel over queries
+    let correct: usize = (0..queries_f32.len())
+        .into_par_iter()
+        .map(|qi| {
+            let q = &queries_f32[qi];
+            let nns = index.search(q, k, beam);
 
-        let kth_sq = gt[qi][k - 1].1;
-        let kth = kth_sq.sqrt();
+            // Ground truth stores squared L2
+            let kth = gt[qi][k - 1].1.sqrt();
 
-        // Count how many returned are within GT@k radius
-        for &id in &nns {
-            let v = index.get_vector(id as usize);
-            let d = euclid(q, &v);
-            if d <= kth {
-                correct += 1;
+            // Count how many returned are within GT@k radius
+            let mut c = 0usize;
+            for &id in &nns {
+                let v = index.get_vector(id as usize);
+                let d = euclid(q, &v);
+                if d <= kth {
+                    c += 1;
+                }
             }
-        }
-    }
+            c
+        })
+        .sum();
 
     let secs = t0.elapsed().as_secs_f32();
     let recall = (correct as f32) / ((k * queries_f32.len()) as f32);
