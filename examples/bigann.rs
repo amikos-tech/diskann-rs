@@ -35,10 +35,10 @@ const INDEX_PATH: &str = "big_diskann_index.db";
 // DiskANN build/search knobs (feel free to tweak).
 const DISKANN_PARAMS: DiskAnnParams = DiskAnnParams {
     max_degree: 48,
-    build_beam_width: 128,
+    build_beam_width: 200,
     alpha: 1.2,
 };
-const BEAM_SEARCH: usize = 512;
+const BEAM_SEARCH: usize = 1024;
 
 fn read_bvecs_block<const SIZE: usize>(
     r: &mut BufReader<File>,
