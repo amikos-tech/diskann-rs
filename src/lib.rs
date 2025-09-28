@@ -482,7 +482,7 @@ fn calculate_medoid<D: Distance<f32> + Copy + Sync>(vectors: &[Vec<f32>], dist: 
 /// Builds a strengthened Vamana-like graph using multi-pass refinement.
 /// - Multi-seed candidate gathering (medoid + random seeds)
 /// - Union with current adjacency before α-prune
-/// - 6 refinement passes with symmetrization after each pass
+/// - 2 refinement passes with symmetrization after each pass
 fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
     vectors: &[Vec<f32>],
     max_degree: usize,
