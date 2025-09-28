@@ -35,21 +35,25 @@ use diskann_rs::{DiskANN, DiskAnnParams};
 
 // Your vectors to index (all rows must share the same dimension)
 let vectors: Vec<Vec<f32>> = vec![
-    vec![0.1, 0.2, 0.3, /* ... */],
-    vec![0.4, 0.5, 0.6, /* ... */],
-    // ...
+    vec![0.1, 0.2, 0.3],
+    vec![0.4, 0.5, 0.6],
 ];
 
-// Construction parameters
+// Easiest: build with defaults (M=64, L_build=128, alpha=1.2)
+let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, "index.db")?;
+
+// Or: custom construction parameters
 let params = DiskAnnParams {
-    dim: 128,              // vector dimension
-    max_degree: 32,        // max neighbors per node
+    max_degree: 48,        // max neighbors per node
     build_beam_width: 128, // construction beam width
     alpha: 1.2,            // α for pruning
 };
-
-// Choose a distance (here: L2). Use DistCosine for cosine, etc.
-let index = DiskANN::<DistL2>::build_index(&vectors, &params, "index.dann")?;
+let index2 = DiskANN::<DistCosine>::build_index_with_params(
+    &vectors,
+    DistCosine {},
+    "index_cos.db",
+    params,
+)?;
 ```
 
 ### Opening an Existing Index
@@ -58,41 +62,46 @@ let index = DiskANN::<DistL2>::build_index(&vectors, &params, "index.dann")?;
 use anndists::dist::DistL2;
 use diskann_rs::DiskANN;
 
-// The distance type must match what you used at build time
-let index = DiskANN::<DistL2>::open("index.dann")?;
+// If you built with DistL2 and defaults:
+let index = DiskANN::<DistL2>::open_index_default_metric("index.db")?;
+
+// Or, explicitly provide the distance you built with:
+let index2 = DiskANN::<DistL2>::open_index_with("index.db", DistL2 {})?;
 ```
 
 ### Searching the Index
 
 ```rust
-use diskann_rs::SearchParams;
+use anndists::dist::DistL2;
+use diskann_rs::DiskANN;
 
-let query: Vec<f32> = vec![0.1, 0.2, /* ... */]; // length must equal params.dim
+let index = DiskANN::<DistL2>::open_index_default_metric("index.db")?;
+let query: Vec<f32> = vec![0.1, 0.2, 0.4]; // length must match the indexed dim
 let k = 10;
+let beam = 256; // search beam width
 
-// Search parameters (tune for recall vs speed)
-let sp = SearchParams { beam_width: 64 };
+// (IDs, distance)
+let hits: Vec<(u32, f32)> = index.search_with_dists(&query, 10, beam);
+// `neighbors` are the IDs of the k nearest vectors
+let neighbors: Vec<u32> = index.search(&query, k, beam);
 
-let neighbors: Vec<u32> = index.search(&query, k, &sp);
-// neighbors contains the IDs of the k nearest vectors
 ```
 
 ### Parallel Search
 
 ```rust
+use anndists::dist::DistL2;
+use diskann_rs::DiskANN;
 use rayon::prelude::*;
-use std::sync::Arc;
-use diskann_rs::SearchParams;
 
-let index = Arc::new(index);
-let sp = Arc::new(SearchParams { beam_width: 64 });
+let index = DiskANN::<DistL2>::open_index_default_metric("index.db")?;
 
 // Suppose you have a batch of queries
 let query_batch: Vec<Vec<f32>> = /* ... */;
 
 let results: Vec<Vec<u32>> = query_batch
     .par_iter()
-    .map(|q| index.search(q, 10, &sp))
+    .map(|q| index.search(q, 10, 256))
     .collect();
 ```
 
@@ -166,6 +175,7 @@ See the `examples/` directory for:
 - `perf_test.rs`: Performance benchmarking with 1M vectors
 - `diskann_mnist.rs`: Performance benchmarking with MNIST fashion dataset (60K)
 - `diskann_sift.rs`: Performance benchmarking with SIFT 1M dataset
+- `bigann.rs`: Performance benchmarking with SIFT 10M dataset
 
 ## Benchmark against HNSW ([hnsw_rs](https://crates.io/crates/hnsw_rs) crate)
 ```bash

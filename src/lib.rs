@@ -1,4 +1,4 @@
-//! # DiskAnnRS (generic over `anndists::Distance<f32>`)
+//! # DiskAnn (generic over `anndists::Distance<f32>`)
 //!
 //! A minimal, on-disk, DiskANN-like library that:
 //! - Builds a Vamana-style graph (greedy + α-pruning) in memory
@@ -359,50 +359,48 @@ where
 
     /// Searches the index for nearest neighbors using a best-first beam search.
     /// Termination rule: continue while the best frontier can still improve the worst in working set.
-    pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<u32> {
-        assert_eq!(
-            query.len(),
-            self.dim,
-            "Query dim {} != index dim {}",
-            query.len(),
-            self.dim
-        );
+    /// Like `search` but also returns the distance for each neighbor.
+    /// Distances are exactly the ones computed during the beam search.
+    pub fn search_with_dists(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<(u32, f32)> {
+        assert_eq!(query.len(), self.dim, "Query dim {} != index dim {}", query.len(), self.dim);
+
+        use std::collections::HashSet;
+        use std::cmp::{Reverse, Ordering};
+        use std::collections::BinaryHeap;
+
+        #[derive(Clone, Copy)]
+        struct Candidate { dist: f32, id: u32 }
+        impl PartialEq for Candidate { fn eq(&self, o:&Self)->bool { self.dist==o.dist && self.id==o.id } }
+        impl Eq for Candidate {}
+        impl PartialOrd for Candidate { fn partial_cmp(&self,o:&Self)->Option<Ordering>{ self.dist.partial_cmp(&o.dist) } }
+        impl Ord for Candidate { fn cmp(&self,o:&Self)->Ordering { self.partial_cmp(o).unwrap_or(Ordering::Equal) } }
 
         let mut visited = HashSet::new();
-        let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new(); // min-heap by dist
-        let mut w: BinaryHeap<Candidate> = BinaryHeap::new(); // max-heap by dist (peek = worst)
+        let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new(); // best-first by dist
+        let mut w: BinaryHeap<Candidate> = BinaryHeap::new();                 // working set, max-heap by dist
 
-        // Seed from medoid
+        // seed from medoid
         let start_dist = self.distance_to(query, self.medoid_id as usize);
-        let start = Candidate {
-            dist: start_dist,
-            id: self.medoid_id,
-        };
+        let start = Candidate { dist: start_dist, id: self.medoid_id };
         frontier.push(Reverse(start));
         w.push(start);
         visited.insert(self.medoid_id);
 
-        // Expand while there's potential improvement
+        // expand while best frontier can still improve worst in working set
         while let Some(Reverse(best)) = frontier.peek().copied() {
             if w.len() >= beam_width {
                 if let Some(worst) = w.peek() {
-                    if best.dist >= worst.dist {
-                        break;
-                    }
+                    if best.dist >= worst.dist { break; }
                 }
             }
             let Reverse(current) = frontier.pop().unwrap();
 
-            for &neighbor_id in self.get_neighbors(current.id) {
-                if neighbor_id == PAD_U32 {
-                    continue;
-                }
-                if !visited.insert(neighbor_id) {
-                    continue;
-                }
+            for &nb in self.get_neighbors(current.id) {
+                if nb == PAD_U32 { continue; }
+                if !visited.insert(nb) { continue; }
 
-                let d = self.distance_to(query, neighbor_id as usize);
-                let cand = Candidate { dist: d, id: neighbor_id };
+                let d = self.distance_to(query, nb as usize);
+                let cand = Candidate { dist: d, id: nb };
 
                 if w.len() < beam_width {
                     w.push(cand);
@@ -415,11 +413,18 @@ where
             }
         }
 
-        // Extract top-k by distance
+        // top-k by distance, keep distances
         let mut results: Vec<_> = w.into_vec();
-        results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        results.sort_by(|a,b| a.dist.partial_cmp(&b.dist).unwrap());
         results.truncate(k);
-        results.into_iter().map(|c| c.id).collect()
+        results.into_iter().map(|c| (c.id, c.dist)).collect()
+    }
+    /// search but only return neighbor ids
+    pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<u32> {
+    self.search_with_dists(query, k, beam_width)
+        .into_iter()
+        .map(|(id, _dist)| id)
+        .collect()
     }
 
     /// Gets the neighbors of a node from the (fixed-degree) adjacency region

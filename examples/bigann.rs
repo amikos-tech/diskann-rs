@@ -292,7 +292,7 @@ fn eval_recall_single(
 
 fn main() {
     // Toggle this to choose evaluation mode
-    const PARALLEL: bool = false;
+    const PARALLEL: bool = true;
 
     // Filenames in repo root
     // download all data here: http://corpus-texmex.irisa.fr (ANN_SIFT1B)
