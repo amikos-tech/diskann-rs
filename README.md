@@ -216,7 +216,7 @@ total cpu time for search requests 3838.7310ms , system time 263.571ms
 
 ## Current Implementation
 
-✅ **Completed Features**:
+**Completed Features**:
 - Single-file storage format with memory mapping
 - Vamana graph construction with α-pruning
 - Beam search with medoid entry points
