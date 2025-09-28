@@ -54,7 +54,10 @@ fn main() -> Result<(), DiskAnnError> {
         let elapsed = start.elapsed().as_secs_f32();
         println!("Done building index in {:.2} s", elapsed);
     } else {
-        println!("Index file {} already exists, skipping build.", singlefile_path);
+        println!(
+            "Index file {} already exists, skipping build.",
+            singlefile_path
+        );
     }
 
     // Open index (must use the same distance type used at build time)
@@ -114,7 +117,10 @@ fn main() -> Result<(), DiskAnnError> {
     let search_time = search_start.elapsed().as_secs_f32();
 
     println!("Performed {} queries in {:.2} s", num_queries, search_time);
-    println!("Throughput: {:.2} queries/sec", num_queries as f32 / search_time);
+    println!(
+        "Throughput: {:.2} queries/sec",
+        num_queries as f32 / search_time
+    );
 
     // Verify all queries returned results
     let all_valid = results.iter().all(|r| r.len() == k.min(index.num_vectors));

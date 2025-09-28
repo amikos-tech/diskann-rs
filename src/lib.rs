@@ -182,7 +182,14 @@ where
         file_path: &str,
         p: DiskAnnParams,
     ) -> Result<Self, DiskAnnError> {
-        Self::build_index(vectors, p.max_degree, p.build_beam_width, p.alpha, dist, file_path)
+        Self::build_index(
+            vectors,
+            p.max_degree,
+            p.build_beam_width,
+            p.alpha,
+            dist,
+            file_path,
+        )
     }
 }
 
@@ -362,26 +369,46 @@ where
     /// Like `search` but also returns the distance for each neighbor.
     /// Distances are exactly the ones computed during the beam search.
     pub fn search_with_dists(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<(u32, f32)> {
-        assert_eq!(query.len(), self.dim, "Query dim {} != index dim {}", query.len(), self.dim);
-
-        use std::collections::HashSet;
-        use std::cmp::{Reverse, Ordering};
-        use std::collections::BinaryHeap;
+        assert_eq!(
+            query.len(),
+            self.dim,
+            "Query dim {} != index dim {}",
+            query.len(),
+            self.dim
+        );
 
         #[derive(Clone, Copy)]
-        struct Candidate { dist: f32, id: u32 }
-        impl PartialEq for Candidate { fn eq(&self, o:&Self)->bool { self.dist==o.dist && self.id==o.id } }
+        struct Candidate {
+            dist: f32,
+            id: u32,
+        }
+        impl PartialEq for Candidate {
+            fn eq(&self, o: &Self) -> bool {
+                self.dist == o.dist && self.id == o.id
+            }
+        }
         impl Eq for Candidate {}
-        impl PartialOrd for Candidate { fn partial_cmp(&self,o:&Self)->Option<Ordering>{ self.dist.partial_cmp(&o.dist) } }
-        impl Ord for Candidate { fn cmp(&self,o:&Self)->Ordering { self.partial_cmp(o).unwrap_or(Ordering::Equal) } }
+        impl PartialOrd for Candidate {
+            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+                self.dist.partial_cmp(&o.dist)
+            }
+        }
+        impl Ord for Candidate {
+            fn cmp(&self, o: &Self) -> Ordering {
+                self.partial_cmp(o).unwrap_or(Ordering::Equal)
+            }
+        }
 
         let mut visited = HashSet::new();
         let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new(); // best-first by dist
-        let mut w: BinaryHeap<Candidate> = BinaryHeap::new();                 // working set, max-heap by dist
+        let mut w: BinaryHeap<Candidate> = BinaryHeap::new(); // working set, max-heap by dist
 
         // seed from medoid
         let start_dist = self.distance_to(query, self.medoid_id as usize);
-        let start = Candidate { dist: start_dist, id: self.medoid_id };
+        let start = Candidate {
+            dist: start_dist,
+            id: self.medoid_id,
+        };
         frontier.push(Reverse(start));
         w.push(start);
         visited.insert(self.medoid_id);
@@ -390,14 +417,20 @@ where
         while let Some(Reverse(best)) = frontier.peek().copied() {
             if w.len() >= beam_width {
                 if let Some(worst) = w.peek() {
-                    if best.dist >= worst.dist { break; }
+                    if best.dist >= worst.dist {
+                        break;
+                    }
                 }
             }
             let Reverse(current) = frontier.pop().unwrap();
 
             for &nb in self.get_neighbors(current.id) {
-                if nb == PAD_U32 { continue; }
-                if !visited.insert(nb) { continue; }
+                if nb == PAD_U32 {
+                    continue;
+                }
+                if !visited.insert(nb) {
+                    continue;
+                }
 
                 let d = self.distance_to(query, nb as usize);
                 let cand = Candidate { dist: d, id: nb };
@@ -415,16 +448,16 @@ where
 
         // top-k by distance, keep distances
         let mut results: Vec<_> = w.into_vec();
-        results.sort_by(|a,b| a.dist.partial_cmp(&b.dist).unwrap());
+        results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
         results.truncate(k);
         results.into_iter().map(|c| (c.id, c.dist)).collect()
     }
     /// search but only return neighbor ids
     pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<u32> {
-    self.search_with_dists(query, k, beam_width)
-        .into_iter()
-        .map(|(id, _dist)| id)
-        .collect()
+        self.search_with_dists(query, k, beam_width)
+            .into_iter()
+            .map(|(id, _dist)| id)
+            .collect()
     }
 
     /// Gets the neighbors of a node from the (fixed-degree) adjacency region
@@ -476,10 +509,7 @@ fn calculate_medoid<D: Distance<f32> + Copy + Sync>(vectors: &[Vec<f32>], dist: 
         .par_iter()
         .enumerate()
         .map(|(idx, v)| (idx, dist.eval(&centroid, v)))
-        .reduce(
-            || (0usize, f32::MAX),
-            |a, b| if a.1 <= b.1 { a } else { b },
-        );
+        .reduce(|| (0usize, f32::MAX), |a, b| if a.1 <= b.1 { a } else { b });
 
     best_idx
 }
@@ -583,7 +613,9 @@ fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
         // Symmetrize: union incoming + outgoing, then α-prune again (parallel)
         // Build inverse map: node-id -> position in `order`
         let mut pos_of = vec![0usize; n];
-        for (pos, &u) in order.iter().enumerate() { pos_of[u] = pos; }
+        for (pos, &u) in order.iter().enumerate() {
+            pos_of[u] = pos;
+        }
 
         // Build incoming as CSR
         let (incoming_flat, incoming_off) = build_incoming_csr(&order, &new_graph, n);
@@ -775,7 +807,11 @@ mod tests {
     use std::fs;
 
     fn euclid(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f32>()
+            .sqrt()
     }
 
     #[test]
@@ -791,8 +827,7 @@ mod tests {
             vec![0.5, 0.5],
         ];
 
-        let index =
-            DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, path).unwrap();
+        let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, path).unwrap();
 
         let q = vec![0.1, 0.1];
         let nns = index.search(&q, 3, 8);
@@ -827,9 +862,9 @@ mod tests {
 
         // Top neighbor should have high cosine similarity (close direction)
         let v = index.get_vector(nns[0] as usize);
-        let dot = v.iter().zip(&q).map(|(a,b)| a*b).sum::<f32>();
-        let n1 = v.iter().map(|x| x*x).sum::<f32>().sqrt();
-        let n2 = q.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let dot = v.iter().zip(&q).map(|(a, b)| a * b).sum::<f32>();
+        let n1 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let n2 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
         let cos = dot / (n1 * n2);
         assert!(cos > 0.7);
 
@@ -877,13 +912,17 @@ mod tests {
             }
         }
 
-        let index =
-            DiskANN::<DistL2>::build_index_with_params(
-                &vectors,
-                DistL2 {},
-                path,
-                DiskAnnParams { max_degree: 4, build_beam_width: 64, alpha: 1.5 }
-            ).unwrap();
+        let index = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 4,
+                build_beam_width: 64,
+                alpha: 1.5,
+            },
+        )
+        .unwrap();
 
         for target in 0..vectors.len() {
             let q = &vectors[target];
@@ -913,23 +952,30 @@ mod tests {
             .map(|_| (0..d).map(|_| rng.r#gen::<f32>()).collect())
             .collect();
 
-        let index =
-            DiskANN::<DistL2>::build_index_with_params(
-                &vectors,
-                DistL2 {},
-                path,
-                DiskAnnParams { max_degree: 32, build_beam_width: 128, alpha: 1.2 }
-            ).unwrap();
+        let index = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 32,
+                build_beam_width: 128,
+                alpha: 1.2,
+            },
+        )
+        .unwrap();
 
         let q: Vec<f32> = (0..d).map(|_| rng.r#gen::<f32>()).collect();
         let res = index.search(&q, 10, 64);
         assert_eq!(res.len(), 10);
 
         // Ensure distances are nondecreasing
-        let dists: Vec<f32> = res.iter().map(|&id| {
-            let v = index.get_vector(id as usize);
-            euclid(&q, &v)
-        }).collect();
+        let dists: Vec<f32> = res
+            .iter()
+            .map(|&id| {
+                let v = index.get_vector(id as usize);
+                euclid(&q, &v)
+            })
+            .collect();
         let mut sorted = dists.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(dists, sorted);

@@ -11,14 +11,14 @@
 //!   (then mmaps it). Building on the full dataset requires a lot of RAM.
 //!   Adjust NB_DATA_POINTS to a subset if needed.
 
+use anndists::dist::DistL2;
+use byteorder::{LittleEndian, ReadBytesExt};
+use diskann_rs::{DiskANN, DiskAnnParams};
+use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 use std::time::Instant;
-use rayon::prelude::*; 
-use anndists::dist::DistL2;
-use byteorder::{LittleEndian, ReadBytesExt};
-use diskann_rs::{DiskANN, DiskAnnParams};
 
 const DIM: usize = 128;
 
@@ -124,7 +124,11 @@ fn read_u32_block(r: &mut BufReader<File>) -> io::Result<Vec<u32>> {
 
 /// Returns ground truth as Vec[query] -> Vec[(id, sqdist)].
 /// BigANN dis_*.fvecs contains **squared** L2; we `sqrt` later when comparing.
-fn read_ground_truth(i_path: &str, f_path: &str, n_queries: usize) -> io::Result<Vec<Vec<(u32, f32)>>> {
+fn read_ground_truth(
+    i_path: &str,
+    f_path: &str,
+    n_queries: usize,
+) -> io::Result<Vec<Vec<(u32, f32)>>> {
     let fi = OpenOptions::new().read(true).open(i_path)?;
     let ff = OpenOptions::new().read(true).open(f_path)?;
     let mut ri = BufReader::new(fi);
@@ -148,7 +152,6 @@ fn read_ground_truth(i_path: &str, f_path: &str, n_queries: usize) -> io::Result
     Ok(gt)
 }
 
-
 #[inline]
 fn u8s_to_f32(v: &[u8]) -> Vec<f32> {
     v.iter().map(|&x| x as f32).collect()
@@ -164,19 +167,17 @@ fn euclid(a: &[f32], b: &[f32]) -> f32 {
     s.sqrt()
 }
 
-
-fn build_or_load_index(
-    base_path: &str,
-    index_path: &str,
-    n_points: usize,
-) -> DiskANN<DistL2> {
+fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> DiskANN<DistL2> {
     if Path::new(index_path).exists() {
         println!("Opening existing index at '{}'", index_path);
         return DiskANN::<DistL2>::open_index_default_metric(index_path)
             .expect("open_index_default_metric failed");
     }
 
-    println!("Building index from '{}' (first {} points)…", base_path, n_points);
+    println!(
+        "Building index from '{}' (first {} points)…",
+        base_path, n_points
+    );
     let t0 = Instant::now();
 
     // Read a prefix of the base BVECs
@@ -195,13 +196,9 @@ fn build_or_load_index(
     );
 
     let t1 = Instant::now();
-    let index = DiskANN::<DistL2>::build_index_with_params(
-        &vectors,
-        DistL2 {},
-        index_path,
-        DISKANN_PARAMS,
-    )
-    .expect("build_index_with_params failed");
+    let index =
+        DiskANN::<DistL2>::build_index_with_params(&vectors, DistL2 {}, index_path, DISKANN_PARAMS)
+            .expect("build_index_with_params failed");
 
     println!(
         "Build + write done in {:.1}s, {}",
@@ -306,13 +303,13 @@ fn main() {
 
     // Read queries
     println!("Reading first {} queries from {}…", NB_QUERY, query_path);
-    let queries_u8 =
-        read_query_bvecs::<DIM>(query_path, NB_QUERY).expect("failed reading queries");
+    let queries_u8 = read_query_bvecs::<DIM>(query_path, NB_QUERY).expect("failed reading queries");
     let queries_f32: Vec<Vec<f32>> = queries_u8.iter().map(|v| u8s_to_f32(v)).collect();
 
     // Read ground truth (10M set)
     println!("Reading ground truth from {}, {}…", gt_i_path, gt_f_path);
-    let gt = read_ground_truth(gt_i_path, gt_f_path, NB_QUERY).expect("failed reading ground truth");
+    let gt =
+        read_ground_truth(gt_i_path, gt_f_path, NB_QUERY).expect("failed reading ground truth");
     let kn = gt[0].len();
     println!("GT loaded: {} queries, GT@{} per query", gt.len(), kn);
 

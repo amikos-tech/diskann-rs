@@ -153,8 +153,12 @@ fn main() -> Result<(), DiskAnnError> {
         let start_cpu = ProcessTime::now();
         let start_wall = SystemTime::now();
 
-        let idx =
-            DiskANN::<DistL2>::build_index_with_params(&train_vectors, DistL2 {}, index_path, params)?;
+        let idx = DiskANN::<DistL2>::build_index_with_params(
+            &train_vectors,
+            DistL2 {},
+            index_path,
+            params,
+        )?;
 
         let cpu_time: Duration = start_cpu.elapsed();
         let wall_time = start_wall.elapsed().unwrap();

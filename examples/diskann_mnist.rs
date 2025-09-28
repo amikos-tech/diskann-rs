@@ -36,11 +36,11 @@ fn main() -> Result<(), DiskAnnError> {
     println!("Ground-truth k per query in file: {}", knbn_max);
 
     // DiskANN build parameters (tune as desired)
-    let max_degree = 48;           
-    let build_beam_width = 128;     // smaller beam for faster build (64–128)
-    let alpha = 1.2;               // standard α
-    let search_k = 10;             // evaluate @k=10 (matches HNSW example)
-    let search_beam = 384;          // search beam: speed/recall tradeoff
+    let max_degree = 48;
+    let build_beam_width = 128; // smaller beam for faster build (64–128)
+    let alpha = 1.2; // standard α
+    let search_k = 10; // evaluate @k=10 (matches HNSW example)
+    let search_beam = 384; // search beam: speed/recall tradeoff
 
     // Build vectors for DiskANN (we only need the float rows; ids are implicit 0..n-1)
     // anndata.train_data is Vec<(Vec<f32>, usize_id)>; we only take the Vec<f32> in order.
@@ -162,8 +162,7 @@ fn main() -> Result<(), DiskAnnError> {
     }
 
     let knbn = search_k;
-    let mean_recall =
-        (recalls.iter().sum::<usize>() as f32) / ((knbn * recalls.len()) as f32);
+    let mean_recall = (recalls.iter().sum::<usize>() as f32) / ((knbn * recalls.len()) as f32);
     let mean_frac_returned =
         (nb_returned.iter().sum::<usize>() as f32) / ((nb_returned.len() * knbn) as f32);
     let mean_last_ratio =
