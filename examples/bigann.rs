@@ -14,7 +14,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use rayon::prelude::*; 
 use anndists::dist::DistL2;
 use byteorder::{LittleEndian, ReadBytesExt};
