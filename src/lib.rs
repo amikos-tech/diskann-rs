@@ -582,6 +582,79 @@ where
         let vector: &[f32] = bytemuck::cast_slice(bytes);
         vector.to_vec()
     }
+
+    /// Serializes the index to a byte vector.
+    ///
+    /// This is the inverse of [`DiskANNRef::from_bytes`] - it produces a byte
+    /// representation that can be loaded later without requiring file system access.
+    ///
+    /// The output format is identical to the on-disk format:
+    /// - 8 bytes: metadata length (u64 little-endian)
+    /// - N bytes: bincode-serialized metadata
+    /// - Padding up to vectors_offset
+    /// - Vector data (num_vectors * dim * 4 bytes)
+    /// - Adjacency data (num_vectors * max_degree * 4 bytes)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use anndists::dist::DistL2;
+    /// use diskann_rs::{DiskANN, DiskANNRef};
+    ///
+    /// // Build an index
+    /// let vectors: Vec<Vec<f32>> = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+    /// let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2{}, "temp.db").unwrap();
+    ///
+    /// // Serialize to bytes
+    /// let bytes = index.to_bytes().unwrap();
+    ///
+    /// // Load from bytes (zero-copy)
+    /// let loaded = DiskANNRef::<DistL2>::from_bytes(&bytes, DistL2{}).unwrap();
+    /// ```
+    pub fn to_bytes(&self) -> Result<Vec<u8>, DiskAnnError> {
+        // Create metadata
+        let metadata = Metadata {
+            dim: self.dim,
+            num_vectors: self.num_vectors,
+            max_degree: self.max_degree,
+            medoid_id: self.medoid_id,
+            vectors_offset: self.vectors_offset,
+            adjacency_offset: self.adjacency_offset,
+            distance_name: self.distance_name.clone(),
+        };
+
+        // Serialize metadata
+        let md_bytes = bincode::serialize(&metadata)?;
+        let md_len = md_bytes.len() as u64;
+
+        // Calculate total size
+        let total_vector_bytes = (self.num_vectors as u64) * (self.dim as u64) * 4;
+        let total_adjacency_bytes = (self.num_vectors as u64) * (self.max_degree as u64) * 4;
+        let total_size = self.adjacency_offset as usize + total_adjacency_bytes as usize;
+
+        // Allocate buffer
+        let mut buffer = vec![0u8; total_size];
+
+        // Write metadata length (first 8 bytes)
+        buffer[0..8].copy_from_slice(&md_len.to_le_bytes());
+
+        // Write metadata
+        buffer[8..8 + md_bytes.len()].copy_from_slice(&md_bytes);
+
+        // Copy vectors from mmap
+        let vectors_start = self.vectors_offset as usize;
+        let vectors_end = vectors_start + total_vector_bytes as usize;
+        buffer[vectors_start..vectors_end]
+            .copy_from_slice(&self.mmap[vectors_start..vectors_end]);
+
+        // Copy adjacency from mmap
+        let adjacency_start = self.adjacency_offset as usize;
+        let adjacency_end = adjacency_start + total_adjacency_bytes as usize;
+        buffer[adjacency_start..adjacency_end]
+            .copy_from_slice(&self.mmap[adjacency_start..adjacency_end]);
+
+        Ok(buffer)
+    }
 }
 
 // =============================================================================
@@ -1342,6 +1415,79 @@ mod tests {
         let mut sorted = dists.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(dists, sorted);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_to_bytes_roundtrip() {
+        let path = "test_to_bytes.db";
+        let _ = fs::remove_file(path);
+
+        // Build index with some vectors
+        let vectors = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+            vec![0.5, 0.5],
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, path).unwrap();
+
+        // Serialize to bytes
+        let bytes = index.to_bytes().unwrap();
+        assert!(!bytes.is_empty());
+
+        // Load from bytes
+        let loaded = DiskANNRef::<DistL2>::from_bytes(&bytes, DistL2 {}).unwrap();
+
+        // Verify metadata matches
+        assert_eq!(loaded.dim, index.dim);
+        assert_eq!(loaded.num_vectors, index.num_vectors);
+        assert_eq!(loaded.max_degree, index.max_degree);
+
+        // Verify vectors match
+        for i in 0..vectors.len() {
+            let orig = index.get_vector(i);
+            let from_bytes = loaded.get_vector(i);
+            assert_eq!(orig, from_bytes);
+        }
+
+        // Verify search produces same results
+        let q = vec![0.1, 0.1];
+        let orig_results = index.search(&q, 3, 8);
+        let bytes_results = loaded.search(&q, 3, 8);
+        assert_eq!(orig_results, bytes_results);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_to_bytes_with_different_metrics() {
+        // Test with Cosine metric
+        let path = "test_to_bytes_cosine.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+
+        let index =
+            DiskANN::<DistCosine>::build_index_default(&vectors, DistCosine {}, path).unwrap();
+
+        let bytes = index.to_bytes().unwrap();
+        let loaded = DiskANNRef::<DistCosine>::from_bytes(&bytes, DistCosine {}).unwrap();
+
+        assert_eq!(loaded.dim, index.dim);
+        assert_eq!(loaded.num_vectors, index.num_vectors);
+
+        // Search should work correctly
+        let q = vec![1.0, 0.0, 0.0];
+        let results = loaded.search(&q, 1, 8);
+        assert_eq!(results.len(), 1);
 
         let _ = fs::remove_file(path);
     }
