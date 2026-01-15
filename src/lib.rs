@@ -140,6 +140,62 @@ struct Metadata {
     distance_name: String,
 }
 
+// =============================================================================
+// Byte Storage Abstraction (for zero-copy loading)
+// =============================================================================
+
+/// Storage backend abstraction for index data.
+///
+/// This enum allows indexes to be backed by either:
+/// - A memory-mapped file (owned)
+/// - A borrowed byte slice (zero-copy from external source)
+pub enum ByteStorage<'a> {
+    /// Memory-mapped file (owned by the index)
+    Mmap(Mmap),
+    /// Borrowed byte slice (external lifetime management)
+    Borrowed(&'a [u8]),
+}
+
+impl<'a> ByteStorage<'a> {
+    /// Get the underlying bytes
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            ByteStorage::Mmap(m) => &m[..],
+            ByteStorage::Borrowed(b) => b,
+        }
+    }
+
+    /// Get the length of the underlying bytes
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            ByteStorage::Mmap(m) => m.len(),
+            ByteStorage::Borrowed(b) => b.len(),
+        }
+    }
+
+    /// Check if the storage is empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<'a> AsRef<[u8]> for ByteStorage<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl<'a> std::ops::Index<std::ops::Range<usize>> for ByteStorage<'a> {
+    type Output = [u8];
+
+    fn index(&self, range: std::ops::Range<usize>) -> &Self::Output {
+        &self.as_bytes()[range]
+    }
+}
+
 /// Candidate for search/frontier queues
 #[derive(Clone, Copy)]
 struct Candidate {
@@ -525,6 +581,275 @@ where
         let bytes = &self.mmap[start..end];
         let vector: &[f32] = bytemuck::cast_slice(bytes);
         vector.to_vec()
+    }
+}
+
+// =============================================================================
+// DiskANNRef: Zero-copy index from borrowed bytes
+// =============================================================================
+
+/// A DiskANN index that borrows its data from an external byte slice.
+///
+/// This type enables zero-copy loading of indexes from in-memory byte slices,
+/// such as embedded data, network responses, or pre-loaded files.
+///
+/// # Safety
+///
+/// The caller must ensure that the byte slice passed to [`from_bytes`](Self::from_bytes)
+/// remains valid and stable for the entire lifetime `'a` of this index. The index
+/// does NOT copy the data.
+///
+/// # Example
+///
+/// ```no_run
+/// use anndists::dist::DistL2;
+/// use diskann_rs::DiskANNRef;
+/// use std::fs;
+///
+/// // Load index bytes from file
+/// let bytes = fs::read("index.db").unwrap();
+///
+/// // Create zero-copy index (bytes must outlive the index)
+/// let index = DiskANNRef::<DistL2>::from_bytes(&bytes, DistL2{}).unwrap();
+///
+/// // Search
+/// let query = vec![0.0; 128];
+/// let neighbors = index.search(&query, 10, 64);
+/// ```
+pub struct DiskANNRef<'a, D>
+where
+    D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
+{
+    /// Dimensionality of vectors in the index
+    pub dim: usize,
+    /// Number of vectors in the index
+    pub num_vectors: usize,
+    /// Maximum number of edges per node
+    pub max_degree: usize,
+    /// Informational: type name of the distance (from metadata)
+    pub distance_name: String,
+
+    /// ID of the medoid (used as entry point)
+    pub(crate) medoid_id: u32,
+    /// Offset to vector data
+    pub(crate) vectors_offset: u64,
+    /// Offset to adjacency data
+    pub(crate) adjacency_offset: u64,
+
+    /// Borrowed byte storage
+    pub(crate) storage: ByteStorage<'a>,
+
+    /// The distance strategy
+    pub(crate) dist: D,
+}
+
+impl<'a, D> DiskANNRef<'a, D>
+where
+    D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
+{
+    /// Load an index from a borrowed byte slice (zero-copy).
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - The raw index file bytes
+    /// * `dist` - The distance metric (must match what was used during build)
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `bytes` remains valid and stable for the
+    /// entire lifetime of this index. The index does NOT copy the data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The byte slice is too small
+    /// - The metadata is corrupted
+    /// - The byte slice doesn't contain enough data for the index
+    pub fn from_bytes(bytes: &'a [u8], dist: D) -> Result<Self, DiskAnnError> {
+        if bytes.len() < 8 {
+            return Err(DiskAnnError::IndexError(
+                "byte slice too small for metadata length".to_string(),
+            ));
+        }
+
+        // Read metadata length (first 8 bytes)
+        let md_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+
+        if bytes.len() < 8 + md_len {
+            return Err(DiskAnnError::IndexError(format!(
+                "byte slice too small for metadata: need {} bytes, got {}",
+                8 + md_len,
+                bytes.len()
+            )));
+        }
+
+        // Deserialize metadata
+        let metadata: Metadata = bincode::deserialize(&bytes[8..8 + md_len])?;
+
+        // Validate byte slice has enough data for vectors and adjacency
+        let expected_size = metadata.adjacency_offset as usize
+            + (metadata.num_vectors * metadata.max_degree * 4);
+        if bytes.len() < expected_size {
+            return Err(DiskAnnError::IndexError(format!(
+                "byte slice too small: got {} bytes, need at least {}",
+                bytes.len(),
+                expected_size
+            )));
+        }
+
+        // Optional: warn if distance type differs from recorded
+        let expected = std::any::type_name::<D>();
+        if metadata.distance_name != expected {
+            eprintln!(
+                "Warning: index recorded distance `{}` but opened with `{}`",
+                metadata.distance_name, expected
+            );
+        }
+
+        Ok(Self {
+            dim: metadata.dim,
+            num_vectors: metadata.num_vectors,
+            max_degree: metadata.max_degree,
+            distance_name: metadata.distance_name,
+            medoid_id: metadata.medoid_id,
+            vectors_offset: metadata.vectors_offset,
+            adjacency_offset: metadata.adjacency_offset,
+            storage: ByteStorage::Borrowed(bytes),
+            dist,
+        })
+    }
+
+    /// Get the underlying bytes
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        self.storage.as_bytes()
+    }
+
+    /// Gets the neighbors of a node from the adjacency region
+    fn get_neighbors(&self, node_id: u32) -> &[u32] {
+        let offset = self.adjacency_offset + (node_id as u64 * self.max_degree as u64 * 4);
+        let start = offset as usize;
+        let end = start + (self.max_degree * 4);
+        let bytes = &self.bytes()[start..end];
+        bytemuck::cast_slice(bytes)
+    }
+
+    /// Computes distance between `query` and vector at `idx`
+    fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
+        let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
+        let start = offset as usize;
+        let end = start + (self.dim * 4);
+        let bytes = &self.bytes()[start..end];
+        let vector: &[f32] = bytemuck::cast_slice(bytes);
+        self.dist.eval(query, vector)
+    }
+
+    /// Gets a vector from the index
+    pub fn get_vector(&self, idx: usize) -> Vec<f32> {
+        let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
+        let start = offset as usize;
+        let end = start + (self.dim * 4);
+        let bytes = &self.bytes()[start..end];
+        let vector: &[f32] = bytemuck::cast_slice(bytes);
+        vector.to_vec()
+    }
+
+    /// Searches the index for nearest neighbors.
+    ///
+    /// Returns the IDs of the k nearest neighbors.
+    pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<u32> {
+        self.search_with_dists(query, k, beam_width)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Searches the index for nearest neighbors with distances.
+    ///
+    /// Returns pairs of (neighbor_id, distance) for the k nearest neighbors.
+    pub fn search_with_dists(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<(u32, f32)> {
+        assert_eq!(
+            query.len(),
+            self.dim,
+            "Query dim {} != index dim {}",
+            query.len(),
+            self.dim
+        );
+
+        #[derive(Clone, Copy)]
+        struct Candidate {
+            dist: f32,
+            id: u32,
+        }
+        impl PartialEq for Candidate {
+            fn eq(&self, o: &Self) -> bool {
+                self.dist == o.dist && self.id == o.id
+            }
+        }
+        impl Eq for Candidate {}
+        impl PartialOrd for Candidate {
+            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+                self.dist.partial_cmp(&o.dist)
+            }
+        }
+        impl Ord for Candidate {
+            fn cmp(&self, o: &Self) -> Ordering {
+                self.partial_cmp(o).unwrap_or(Ordering::Equal)
+            }
+        }
+
+        let mut visited = HashSet::new();
+        let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
+        let mut w: BinaryHeap<Candidate> = BinaryHeap::new();
+
+        // Seed from medoid
+        let start_dist = self.distance_to(query, self.medoid_id as usize);
+        let start = Candidate {
+            dist: start_dist,
+            id: self.medoid_id,
+        };
+        frontier.push(Reverse(start));
+        w.push(start);
+        visited.insert(self.medoid_id);
+
+        // Expand while best frontier can still improve worst in working set
+        while let Some(Reverse(best)) = frontier.peek().copied() {
+            if w.len() >= beam_width {
+                if let Some(worst) = w.peek() {
+                    if best.dist >= worst.dist {
+                        break;
+                    }
+                }
+            }
+            let Reverse(current) = frontier.pop().unwrap();
+
+            for &nb in self.get_neighbors(current.id) {
+                if nb == PAD_U32 {
+                    continue;
+                }
+                if !visited.insert(nb) {
+                    continue;
+                }
+
+                let d = self.distance_to(query, nb as usize);
+                let cand = Candidate { dist: d, id: nb };
+
+                if w.len() < beam_width {
+                    w.push(cand);
+                    frontier.push(Reverse(cand));
+                } else if d < w.peek().unwrap().dist {
+                    w.pop();
+                    w.push(cand);
+                    frontier.push(Reverse(cand));
+                }
+            }
+        }
+
+        // Top-k by distance
+        let mut results: Vec<_> = w.into_vec();
+        results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        results.truncate(k);
+        results.into_iter().map(|c| (c.id, c.dist)).collect()
     }
 }
 
