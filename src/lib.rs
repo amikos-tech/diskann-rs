@@ -63,6 +63,7 @@ mod incremental;
 mod filtered;
 pub mod simd;
 pub mod pq;
+pub mod benchmark;
 
 pub use incremental::{
     IncrementalDiskANN, IncrementalConfig, IncrementalStats,
@@ -77,10 +78,12 @@ pub use pq::{ProductQuantizer, PQConfig, PQStats};
 
 use anndists::prelude::Distance;
 use bytemuck;
+use half::f16;
 use memmap2::Mmap;
 use rand::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::OpenOptions;
@@ -95,12 +98,44 @@ pub const DISKANN_DEFAULT_MAX_DEGREE: usize = 64;
 pub const DISKANN_DEFAULT_BUILD_BEAM: usize = 128;
 pub const DISKANN_DEFAULT_ALPHA: f32 = 1.2;
 
+/// Quantization type for vector storage
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuantizationType {
+    /// Full precision 32-bit floating point (default, no compression)
+    #[default]
+    F32,
+    /// Half precision 16-bit floating point (2x compression)
+    F16,
+    /// 8-bit integer with per-vector scaling (4x compression)
+    Int8,
+    /// 4-bit integer with per-vector scaling (8x compression)
+    Int4,
+}
+
+impl QuantizationType {
+    /// Returns the number of bytes per vector element
+    pub fn bytes_per_element(&self) -> f32 {
+        match self {
+            QuantizationType::F32 => 4.0,
+            QuantizationType::F16 => 2.0,
+            QuantizationType::Int8 => 1.0,
+            QuantizationType::Int4 => 0.5,
+        }
+    }
+
+    /// Returns the compression ratio compared to F32
+    pub fn compression_ratio(&self) -> f32 {
+        4.0 / self.bytes_per_element()
+    }
+}
+
 /// Optional bag of knobs if you want to override just a few.
 #[derive(Clone, Copy, Debug)]
 pub struct DiskAnnParams {
     pub max_degree: usize,
     pub build_beam_width: usize,
     pub alpha: f32,
+    pub quantization: QuantizationType,
 }
 impl Default for DiskAnnParams {
     fn default() -> Self {
@@ -108,6 +143,7 @@ impl Default for DiskAnnParams {
             max_degree: DISKANN_DEFAULT_MAX_DEGREE,
             build_beam_width: DISKANN_DEFAULT_BUILD_BEAM,
             alpha: DISKANN_DEFAULT_ALPHA,
+            quantization: QuantizationType::F32,
         }
     }
 }
@@ -128,7 +164,7 @@ pub enum DiskAnnError {
     IndexError(String),
 }
 
-/// Internal metadata structure stored in the index file
+/// Internal metadata structure stored in the index file (legacy v1 format)
 #[derive(Serialize, Deserialize, Debug)]
 struct Metadata {
     dim: usize,
@@ -138,6 +174,42 @@ struct Metadata {
     vectors_offset: u64,
     adjacency_offset: u64,
     distance_name: String,
+}
+
+/// Extended metadata structure with quantization support (v2 format)
+#[derive(Serialize, Deserialize, Debug)]
+struct MetadataV2 {
+    dim: usize,
+    num_vectors: usize,
+    max_degree: usize,
+    medoid_id: u32,
+    vectors_offset: u64,
+    adjacency_offset: u64,
+    distance_name: String,
+    /// Format version (currently 2)
+    version: u32,
+    /// Quantization type used for vector storage
+    quantization: QuantizationType,
+}
+
+impl MetadataV2 {
+    /// Current metadata format version
+    const CURRENT_VERSION: u32 = 2;
+
+    /// Upgrade from legacy Metadata (v1) format
+    fn from_legacy(m: Metadata) -> Self {
+        Self {
+            dim: m.dim,
+            num_vectors: m.num_vectors,
+            max_degree: m.max_degree,
+            medoid_id: m.medoid_id,
+            vectors_offset: m.vectors_offset,
+            adjacency_offset: m.adjacency_offset,
+            distance_name: m.distance_name,
+            version: 1,
+            quantization: QuantizationType::F32,
+        }
+    }
 }
 
 // =============================================================================
@@ -220,6 +292,11 @@ impl Ord for Candidate {
     }
 }
 
+// Thread-local buffer for F16 dequantization to avoid allocation during search
+thread_local! {
+    static DECODE_BUFFER: RefCell<Vec<f32>> = RefCell::new(Vec::with_capacity(4096));
+}
+
 /// Main struct representing a DiskANN index (generic over distance)
 pub struct DiskANN<D>
 where
@@ -233,6 +310,8 @@ where
     pub max_degree: usize,
     /// Informational: type name of the distance (from metadata)
     pub distance_name: String,
+    /// Quantization type used for vector storage
+    pub quantization: QuantizationType,
 
     /// ID of the medoid (used as entry point)
     pub(crate) medoid_id: u32,
@@ -253,20 +332,13 @@ impl<D> DiskANN<D>
 where
     D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
 {
-    /// Build with default parameters: (M=32, L=256, alpha=1.2).
+    /// Build with default parameters: (M=64, L=128, alpha=1.2, F32 quantization).
     pub fn build_index_default(
         vectors: &[Vec<f32>],
         dist: D,
         file_path: &str,
     ) -> Result<Self, DiskAnnError> {
-        Self::build_index(
-            vectors,
-            DISKANN_DEFAULT_MAX_DEGREE,
-            DISKANN_DEFAULT_BUILD_BEAM,
-            DISKANN_DEFAULT_ALPHA,
-            dist,
-            file_path,
-        )
+        Self::build_index_with_params(vectors, dist, file_path, DiskAnnParams::default())
     }
 
     /// Build with a `DiskAnnParams` bundle.
@@ -276,14 +348,7 @@ where
         file_path: &str,
         p: DiskAnnParams,
     ) -> Result<Self, DiskAnnError> {
-        Self::build_index(
-            vectors,
-            p.max_degree,
-            p.build_beam_width,
-            p.alpha,
-            dist,
-            file_path,
-        )
+        Self::build_index_internal(vectors, dist, file_path, p)
     }
 }
 
@@ -310,15 +375,8 @@ impl<D> DiskANN<D>
 where
     D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
 {
-    /// Builds a new index from provided vectors
-    ///
-    /// # Arguments
-    /// * `vectors` - The vectors to index (slice of `Vec<f32>`)
-    /// * `max_degree` - Maximum edges per node (M ~ 24-64)
-    /// * `build_beam_width` - Construction L (e.g., 128-400)
-    /// * `alpha` - Pruning parameter (1.2–2.0)
-    /// * `dist` - Any `anndists::Distance<f32>` (e.g., `DistL2`)
-    /// * `file_path` - Path of index file
+    /// Legacy build function for backward compatibility
+    /// Prefer `build_index_with_params` for new code.
     pub fn build_index(
         vectors: &[Vec<f32>],
         max_degree: usize,
@@ -326,6 +384,26 @@ where
         alpha: f32,
         dist: D,
         file_path: &str,
+    ) -> Result<Self, DiskAnnError> {
+        Self::build_index_internal(
+            vectors,
+            dist,
+            file_path,
+            DiskAnnParams {
+                max_degree,
+                build_beam_width,
+                alpha,
+                quantization: QuantizationType::F32,
+            },
+        )
+    }
+
+    /// Internal build function that handles all parameters including quantization
+    fn build_index_internal(
+        vectors: &[Vec<f32>],
+        dist: D,
+        file_path: &str,
+        p: DiskAnnParams,
     ) -> Result<Self, DiskAnnError> {
         if vectors.is_empty() {
             return Err(DiskAnnError::IndexError("No vectors provided".to_string()));
@@ -344,6 +422,17 @@ where
             }
         }
 
+        // Validate quantization type (only F32 and F16 supported for now)
+        match p.quantization {
+            QuantizationType::F32 | QuantizationType::F16 => {}
+            _ => {
+                return Err(DiskAnnError::IndexError(format!(
+                    "Quantization type {:?} not yet supported",
+                    p.quantization
+                )));
+            }
+        }
+
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -352,26 +441,46 @@ where
             .open(file_path)?;
 
         // Reserve space for metadata (we'll write it after data)
-        let vectors_offset = 1024 * 1024;
-        let total_vector_bytes = (num_vectors as u64) * (dim as u64) * 4;
+        let vectors_offset: u64 = 1024 * 1024;
+
+        // Calculate bytes per vector based on quantization
+        let bytes_per_vector = match p.quantization {
+            QuantizationType::F32 => dim * 4,
+            QuantizationType::F16 => dim * 2,
+            _ => unreachable!(),
+        };
+        let total_vector_bytes = (num_vectors as u64) * (bytes_per_vector as u64);
 
         // Write vectors contiguous (sequential I/O is fastest)
         file.seek(SeekFrom::Start(vectors_offset))?;
-        for vector in vectors {
-            let bytes = bytemuck::cast_slice(vector);
-            file.write_all(bytes)?;
+        match p.quantization {
+            QuantizationType::F32 => {
+                for vector in vectors {
+                    let bytes = bytemuck::cast_slice(vector);
+                    file.write_all(bytes)?;
+                }
+            }
+            QuantizationType::F16 => {
+                for vector in vectors {
+                    // Convert f32 -> f16 and write
+                    let f16_values: Vec<f16> = vector.iter().map(|&v| f16::from_f32(v)).collect();
+                    let bytes: &[u8] = bytemuck::cast_slice(&f16_values);
+                    file.write_all(bytes)?;
+                }
+            }
+            _ => unreachable!(),
         }
 
         // Compute medoid using provided distance (parallelized distance eval)
         let medoid_id = calculate_medoid(vectors, dist);
 
         // Build Vamana-like graph (stronger refinement, parallel inner loops)
-        let adjacency_offset = vectors_offset as u64 + total_vector_bytes;
+        let adjacency_offset = vectors_offset + total_vector_bytes;
         let graph = build_vamana_graph(
             vectors,
-            max_degree,
-            build_beam_width,
-            alpha,
+            p.max_degree,
+            p.build_beam_width,
+            p.alpha,
             dist,
             medoid_id as u32,
         );
@@ -380,20 +489,22 @@ where
         file.seek(SeekFrom::Start(adjacency_offset))?;
         for neighbors in &graph {
             let mut padded = neighbors.clone();
-            padded.resize(max_degree, PAD_U32);
+            padded.resize(p.max_degree, PAD_U32);
             let bytes = bytemuck::cast_slice(&padded);
             file.write_all(bytes)?;
         }
 
-        // Write metadata
-        let metadata = Metadata {
+        // Write metadata (v2 format with quantization)
+        let metadata = MetadataV2 {
             dim,
             num_vectors,
-            max_degree,
+            max_degree: p.max_degree,
             medoid_id: medoid_id as u32,
-            vectors_offset: vectors_offset as u64,
+            vectors_offset,
             adjacency_offset,
             distance_name: std::any::type_name::<D>().to_string(),
+            version: MetadataV2::CURRENT_VERSION,
+            quantization: p.quantization,
         };
 
         let md_bytes = bincode::serialize(&metadata)?;
@@ -409,8 +520,9 @@ where
         Ok(Self {
             dim,
             num_vectors,
-            max_degree,
+            max_degree: p.max_degree,
             distance_name: metadata.distance_name,
+            quantization: p.quantization,
             medoid_id: metadata.medoid_id,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
@@ -420,6 +532,7 @@ where
     }
 
     /// Opens an existing index file, supplying the distance strategy explicitly.
+    /// Supports both legacy (v1) and new (v2) metadata formats for backward compatibility.
     pub fn open_index_with(path: &str, dist: D) -> Result<Self, DiskAnnError> {
         let mut file = OpenOptions::new().read(true).write(false).open(path)?;
 
@@ -429,10 +542,19 @@ where
         file.read_exact(&mut buf8)?;
         let md_len = u64::from_le_bytes(buf8);
 
-        // Read metadata
+        // Read metadata bytes
         let mut md_bytes = vec![0u8; md_len as usize];
         file.read_exact(&mut md_bytes)?;
-        let metadata: Metadata = bincode::deserialize(&md_bytes)?;
+
+        // Try to deserialize as v2 format first, fall back to legacy v1 format
+        let metadata: MetadataV2 = match bincode::deserialize(&md_bytes) {
+            Ok(m) => m,
+            Err(_) => {
+                // Fallback: try legacy format
+                let legacy: Metadata = bincode::deserialize(&md_bytes)?;
+                MetadataV2::from_legacy(legacy)
+            }
+        };
 
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
@@ -450,6 +572,7 @@ where
             num_vectors: metadata.num_vectors,
             max_degree: metadata.max_degree,
             distance_name: metadata.distance_name,
+            quantization: metadata.quantization,
             medoid_id: metadata.medoid_id,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
@@ -564,7 +687,18 @@ where
     }
 
     /// Computes distance between `query` and vector `idx`
+    /// Handles both F32 (zero-copy) and F16 (with dequantization) vectors.
     fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
+        match self.quantization {
+            QuantizationType::F32 => self.distance_to_f32(query, idx),
+            QuantizationType::F16 => self.distance_to_f16(query, idx),
+            _ => panic!("Unsupported quantization type: {:?}", self.quantization),
+        }
+    }
+
+    /// F32 distance computation (zero-copy from mmap)
+    #[inline]
+    fn distance_to_f32(&self, query: &[f32], idx: usize) -> f32 {
         let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
         let start = offset as usize;
         let end = start + (self.dim * 4);
@@ -573,14 +707,45 @@ where
         self.dist.eval(query, vector)
     }
 
-    /// Gets a vector from the index (useful for tests)
-    pub fn get_vector(&self, idx: usize) -> Vec<f32> {
-        let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
+    /// F16 distance computation with dequantization using thread-local buffer
+    #[inline]
+    fn distance_to_f16(&self, query: &[f32], idx: usize) -> f32 {
+        let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 2);
         let start = offset as usize;
-        let end = start + (self.dim * 4);
+        let end = start + (self.dim * 2);
         let bytes = &self.mmap[start..end];
-        let vector: &[f32] = bytemuck::cast_slice(bytes);
-        vector.to_vec()
+        let f16_values: &[f16] = bytemuck::cast_slice(bytes);
+
+        DECODE_BUFFER.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.extend(f16_values.iter().map(|v| v.to_f32()));
+            self.dist.eval(query, &buf)
+        })
+    }
+
+    /// Gets a vector from the index (useful for tests)
+    /// Returns dequantized f32 values for quantized indexes.
+    pub fn get_vector(&self, idx: usize) -> Vec<f32> {
+        match self.quantization {
+            QuantizationType::F32 => {
+                let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
+                let start = offset as usize;
+                let end = start + (self.dim * 4);
+                let bytes = &self.mmap[start..end];
+                let vector: &[f32] = bytemuck::cast_slice(bytes);
+                vector.to_vec()
+            }
+            QuantizationType::F16 => {
+                let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 2);
+                let start = offset as usize;
+                let end = start + (self.dim * 2);
+                let bytes = &self.mmap[start..end];
+                let f16_values: &[f16] = bytemuck::cast_slice(bytes);
+                f16_values.iter().map(|v| v.to_f32()).collect()
+            }
+            _ => panic!("Unsupported quantization type: {:?}", self.quantization),
+        }
     }
 
     /// Serializes the index to a byte vector.
@@ -612,8 +777,8 @@ where
     /// let loaded = DiskANNRef::<DistL2>::from_bytes(&bytes, DistL2{}).unwrap();
     /// ```
     pub fn to_bytes(&self) -> Result<Vec<u8>, DiskAnnError> {
-        // Create metadata
-        let metadata = Metadata {
+        // Create metadata (v2 format with quantization)
+        let metadata = MetadataV2 {
             dim: self.dim,
             num_vectors: self.num_vectors,
             max_degree: self.max_degree,
@@ -621,14 +786,23 @@ where
             vectors_offset: self.vectors_offset,
             adjacency_offset: self.adjacency_offset,
             distance_name: self.distance_name.clone(),
+            version: MetadataV2::CURRENT_VERSION,
+            quantization: self.quantization,
         };
 
         // Serialize metadata
         let md_bytes = bincode::serialize(&metadata)?;
         let md_len = md_bytes.len() as u64;
 
+        // Calculate bytes per vector based on quantization
+        let bytes_per_element = match self.quantization {
+            QuantizationType::F32 => 4,
+            QuantizationType::F16 => 2,
+            _ => 4, // fallback
+        };
+
         // Calculate total size
-        let total_vector_bytes = (self.num_vectors as u64) * (self.dim as u64) * 4;
+        let total_vector_bytes = (self.num_vectors as u64) * (self.dim as u64) * bytes_per_element;
         let total_adjacency_bytes = (self.num_vectors as u64) * (self.max_degree as u64) * 4;
         let total_size = self.adjacency_offset as usize + total_adjacency_bytes as usize;
 
@@ -701,6 +875,8 @@ where
     pub max_degree: usize,
     /// Informational: type name of the distance (from metadata)
     pub distance_name: String,
+    /// Quantization type used for vector storage
+    pub quantization: QuantizationType,
 
     /// ID of the medoid (used as entry point)
     pub(crate) medoid_id: u32,
@@ -756,8 +932,15 @@ where
             )));
         }
 
-        // Deserialize metadata
-        let metadata: Metadata = bincode::deserialize(&bytes[8..8 + md_len])?;
+        // Try to deserialize as v2 format first, fall back to legacy v1 format
+        let metadata: MetadataV2 = match bincode::deserialize(&bytes[8..8 + md_len]) {
+            Ok(m) => m,
+            Err(_) => {
+                // Fallback: try legacy format
+                let legacy: Metadata = bincode::deserialize(&bytes[8..8 + md_len])?;
+                MetadataV2::from_legacy(legacy)
+            }
+        };
 
         // Validate byte slice has enough data for vectors and adjacency
         let expected_size = metadata.adjacency_offset as usize
@@ -784,6 +967,7 @@ where
             num_vectors: metadata.num_vectors,
             max_degree: metadata.max_degree,
             distance_name: metadata.distance_name,
+            quantization: metadata.quantization,
             medoid_id: metadata.medoid_id,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
@@ -808,23 +992,57 @@ where
     }
 
     /// Computes distance between `query` and vector at `idx`
+    /// Handles both F32 (zero-copy) and F16 (with dequantization) vectors.
     fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
-        let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
-        let start = offset as usize;
-        let end = start + (self.dim * 4);
-        let bytes = &self.bytes()[start..end];
-        let vector: &[f32] = bytemuck::cast_slice(bytes);
-        self.dist.eval(query, vector)
+        match self.quantization {
+            QuantizationType::F32 => {
+                let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
+                let start = offset as usize;
+                let end = start + (self.dim * 4);
+                let bytes = &self.bytes()[start..end];
+                let vector: &[f32] = bytemuck::cast_slice(bytes);
+                self.dist.eval(query, vector)
+            }
+            QuantizationType::F16 => {
+                let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 2);
+                let start = offset as usize;
+                let end = start + (self.dim * 2);
+                let bytes = &self.bytes()[start..end];
+                let f16_values: &[f16] = bytemuck::cast_slice(bytes);
+
+                DECODE_BUFFER.with(|buf| {
+                    let mut buf = buf.borrow_mut();
+                    buf.clear();
+                    buf.extend(f16_values.iter().map(|v| v.to_f32()));
+                    self.dist.eval(query, &buf)
+                })
+            }
+            _ => panic!("Unsupported quantization type: {:?}", self.quantization),
+        }
     }
 
     /// Gets a vector from the index
+    /// Returns dequantized f32 values for quantized indexes.
     pub fn get_vector(&self, idx: usize) -> Vec<f32> {
-        let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
-        let start = offset as usize;
-        let end = start + (self.dim * 4);
-        let bytes = &self.bytes()[start..end];
-        let vector: &[f32] = bytemuck::cast_slice(bytes);
-        vector.to_vec()
+        match self.quantization {
+            QuantizationType::F32 => {
+                let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
+                let start = offset as usize;
+                let end = start + (self.dim * 4);
+                let bytes = &self.bytes()[start..end];
+                let vector: &[f32] = bytemuck::cast_slice(bytes);
+                vector.to_vec()
+            }
+            QuantizationType::F16 => {
+                let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 2);
+                let start = offset as usize;
+                let end = start + (self.dim * 2);
+                let bytes = &self.bytes()[start..end];
+                let f16_values: &[f16] = bytemuck::cast_slice(bytes);
+                f16_values.iter().map(|v| v.to_f32()).collect()
+            }
+            _ => panic!("Unsupported quantization type: {:?}", self.quantization),
+        }
     }
 
     /// Searches the index for nearest neighbors.
@@ -1356,6 +1574,7 @@ mod tests {
                 max_degree: 4,
                 build_beam_width: 64,
                 alpha: 1.5,
+                quantization: QuantizationType::F32,
             },
         )
         .unwrap();
@@ -1396,6 +1615,7 @@ mod tests {
                 max_degree: 32,
                 build_beam_width: 128,
                 alpha: 1.2,
+                quantization: QuantizationType::F32,
             },
         )
         .unwrap();

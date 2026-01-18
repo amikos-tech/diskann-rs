@@ -78,6 +78,7 @@ impl Default for IncrementalConfig {
                 max_degree: 32,        // Smaller for delta
                 build_beam_width: 64,
                 alpha: 1.2,
+                quantization: crate::QuantizationType::F32,
             },
         }
     }
