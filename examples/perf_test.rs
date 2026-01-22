@@ -42,6 +42,7 @@ fn main() -> Result<(), DiskAnnError> {
             max_degree: MAX_DEGREE,
             build_beam_width: BUILD_BEAM_WIDTH,
             alpha: ALPHA,
+            quantization: diskann_rs::QuantizationType::F32,
         };
 
         // Distance type must be the same for build and open

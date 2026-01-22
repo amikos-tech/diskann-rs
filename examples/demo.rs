@@ -36,6 +36,7 @@ fn main() -> Result<(), DiskAnnError> {
             max_degree,
             build_beam_width,
             alpha,
+            quantization: diskann_rs::QuantizationType::F32,
         };
         let index = DiskANN::<DistCosine>::build_index_with_params(
             &vectors,

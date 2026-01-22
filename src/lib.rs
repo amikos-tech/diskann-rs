@@ -162,6 +162,10 @@ pub enum DiskAnnError {
     /// Represents index-specific errors
     #[error("Index error: {0}")]
     IndexError(String),
+
+    /// Represents data validation errors (NaN, Inf, corrupted data)
+    #[error("Data validation error: {0}")]
+    DataError(String),
 }
 
 /// Internal metadata structure stored in the index file (legacy v1 format)
@@ -190,6 +194,10 @@ struct MetadataV2 {
     version: u32,
     /// Quantization type used for vector storage
     quantization: QuantizationType,
+    /// Offset to per-vector scaling parameters (Int8/Int4 only)
+    /// Each vector has 8 bytes: min (f32) + max (f32)
+    #[serde(default)]
+    scales_offset: Option<u64>,
 }
 
 impl MetadataV2 {
@@ -208,6 +216,7 @@ impl MetadataV2 {
             distance_name: m.distance_name,
             version: 1,
             quantization: QuantizationType::F32,
+            scales_offset: None, // Legacy format is always F32, no scales
         }
     }
 }
@@ -318,6 +327,8 @@ where
     // Offsets
     pub(crate) vectors_offset: u64,
     pub(crate) adjacency_offset: u64,
+    /// Offset to per-vector scaling parameters (Int8/Int4 only)
+    pub(crate) scales_offset: Option<u64>,
 
     /// Memory-mapped file
     pub(crate) mmap: Mmap,
@@ -422,9 +433,21 @@ where
             }
         }
 
-        // Validate quantization type (only F32 and F16 supported for now)
+        // Validate all vector elements are finite (no NaN or Inf)
+        for (i, v) in vectors.iter().enumerate() {
+            for (j, &val) in v.iter().enumerate() {
+                if !val.is_finite() {
+                    return Err(DiskAnnError::DataError(format!(
+                        "Vector {} element {} contains non-finite value: {}",
+                        i, j, val
+                    )));
+                }
+            }
+        }
+
+        // Validate quantization type (F32, F16, and Int8 supported)
         match p.quantization {
-            QuantizationType::F32 | QuantizationType::F16 => {}
+            QuantizationType::F32 | QuantizationType::F16 | QuantizationType::Int8 => {}
             _ => {
                 return Err(DiskAnnError::IndexError(format!(
                     "Quantization type {:?} not yet supported",
@@ -441,15 +464,45 @@ where
             .open(file_path)?;
 
         // Reserve space for metadata (we'll write it after data)
-        let vectors_offset: u64 = 1024 * 1024;
+        let metadata_reserved: u64 = 1024 * 1024;
 
         // Calculate bytes per vector based on quantization
         let bytes_per_vector = match p.quantization {
             QuantizationType::F32 => dim * 4,
             QuantizationType::F16 => dim * 2,
-            _ => unreachable!(),
+            QuantizationType::Int8 => dim, // 1 byte per element
+            QuantizationType::Int4 => unreachable!(), // Not yet supported
         };
         let total_vector_bytes = (num_vectors as u64) * (bytes_per_vector as u64);
+
+        // For Int8, we need a scales section (8 bytes per vector: min + max as f32)
+        let scales_section_bytes = match p.quantization {
+            QuantizationType::Int8 => (num_vectors as u64) * 8,
+            _ => 0,
+        };
+        let scales_offset = if scales_section_bytes > 0 {
+            Some(metadata_reserved)
+        } else {
+            None
+        };
+
+        // Vectors come after scales (if any)
+        let vectors_offset = metadata_reserved + scales_section_bytes;
+
+        // Write scales section for Int8 (must be done before vectors for sequential I/O)
+        if p.quantization == QuantizationType::Int8 {
+            file.seek(SeekFrom::Start(scales_offset.unwrap()))?;
+            for vector in vectors {
+                // Use fold with infinity initial values to handle empty vectors and avoid NaN propagation
+                let min = vector.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max = vector.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                // For empty vectors, use 0.0 as fallback
+                let min = if min.is_finite() { min } else { 0.0 };
+                let max = if max.is_finite() { max } else { 0.0 };
+                file.write_all(&min.to_le_bytes())?;
+                file.write_all(&max.to_le_bytes())?;
+            }
+        }
 
         // Write vectors contiguous (sequential I/O is fastest)
         file.seek(SeekFrom::Start(vectors_offset))?;
@@ -468,14 +521,32 @@ where
                     file.write_all(bytes)?;
                 }
             }
-            _ => unreachable!(),
+            QuantizationType::Int8 => {
+                for vector in vectors {
+                    // Use fold with infinity initial values to handle empty vectors and avoid NaN propagation
+                    let min = vector.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vector.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    // For empty vectors, use 0.0 as fallback
+                    let min = if min.is_finite() { min } else { 0.0 };
+                    let max = if max.is_finite() { max } else { 0.0 };
+                    let range = if max > min { max - min } else { 1.0 };
+                    let codes: Vec<u8> = vector
+                        .iter()
+                        .map(|&v| ((v - min) / range * 255.0).round().clamp(0.0, 255.0) as u8)
+                        .collect();
+                    file.write_all(&codes)?;
+                }
+            }
+            QuantizationType::Int4 => unreachable!(),
         }
 
         // Compute medoid using provided distance (parallelized distance eval)
         let medoid_id = calculate_medoid(vectors, dist);
 
         // Build Vamana-like graph (stronger refinement, parallel inner loops)
-        let adjacency_offset = vectors_offset + total_vector_bytes;
+        // Ensure adjacency is 4-byte aligned for bytemuck::cast_slice
+        let raw_adjacency_offset = vectors_offset + total_vector_bytes;
+        let adjacency_offset = (raw_adjacency_offset + 3) & !3; // Round up to 4-byte boundary
         let graph = build_vamana_graph(
             vectors,
             p.max_degree,
@@ -505,6 +576,7 @@ where
             distance_name: std::any::type_name::<D>().to_string(),
             version: MetadataV2::CURRENT_VERSION,
             quantization: p.quantization,
+            scales_offset,
         };
 
         let md_bytes = bincode::serialize(&metadata)?;
@@ -526,6 +598,7 @@ where
             medoid_id: metadata.medoid_id,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
+            scales_offset,
             mmap,
             dist,
         })
@@ -576,6 +649,7 @@ where
             medoid_id: metadata.medoid_id,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
+            scales_offset: metadata.scales_offset,
             mmap,
             dist,
         })
@@ -687,11 +761,12 @@ where
     }
 
     /// Computes distance between `query` and vector `idx`
-    /// Handles both F32 (zero-copy) and F16 (with dequantization) vectors.
+    /// Handles F32 (zero-copy), F16, and Int8 (with dequantization) vectors.
     fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
         match self.quantization {
             QuantizationType::F32 => self.distance_to_f32(query, idx),
             QuantizationType::F16 => self.distance_to_f16(query, idx),
+            QuantizationType::Int8 => self.distance_to_int8(query, idx),
             _ => panic!("Unsupported quantization type: {:?}", self.quantization),
         }
     }
@@ -724,6 +799,79 @@ where
         })
     }
 
+    /// Int8 distance computation with dequantization using thread-local buffer
+    /// Returns f32::MAX on corrupted data instead of panicking.
+    #[inline]
+    fn distance_to_int8(&self, query: &[f32], idx: usize) -> f32 {
+        // Read per-vector scale parameters (min, max) with bounds checking
+        let scales_offset = match self.scales_offset {
+            Some(off) => off,
+            None => return f32::MAX, // No scales offset means corrupted Int8 index
+        };
+
+        // Use checked arithmetic to prevent overflow
+        let scale_byte_offset = match (idx as u64).checked_mul(8) {
+            Some(v) => v,
+            None => return f32::MAX,
+        };
+        let scale_start = match scales_offset.checked_add(scale_byte_offset) {
+            Some(v) => v as usize,
+            None => return f32::MAX,
+        };
+        let scale_end = scale_start.saturating_add(8);
+
+        // Bounds check before accessing mmap
+        if scale_end > self.mmap.len() {
+            return f32::MAX;
+        }
+
+        let min = f32::from_le_bytes(
+            match self.mmap[scale_start..scale_start + 4].try_into() {
+                Ok(b) => b,
+                Err(_) => return f32::MAX,
+            }
+        );
+        let max = f32::from_le_bytes(
+            match self.mmap[scale_start + 4..scale_start + 8].try_into() {
+                Ok(b) => b,
+                Err(_) => return f32::MAX,
+            }
+        );
+
+        // Validate min/max are finite
+        if !min.is_finite() || !max.is_finite() {
+            return f32::MAX;
+        }
+
+        let range = if max > min { max - min } else { 1.0 };
+
+        // Read quantized codes (1 byte per element) with bounds checking
+        let vec_byte_offset = match (idx as u64).checked_mul(self.dim as u64) {
+            Some(v) => v,
+            None => return f32::MAX,
+        };
+        let vec_start = match self.vectors_offset.checked_add(vec_byte_offset) {
+            Some(v) => v as usize,
+            None => return f32::MAX,
+        };
+        let vec_end = vec_start.saturating_add(self.dim);
+
+        // Bounds check before accessing mmap
+        if vec_end > self.mmap.len() {
+            return f32::MAX;
+        }
+
+        let codes = &self.mmap[vec_start..vec_end];
+
+        // Dequantize into thread-local buffer
+        DECODE_BUFFER.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.extend(codes.iter().map(|&c| c as f32 / 255.0 * range + min));
+            self.dist.eval(query, &buf)
+        })
+    }
+
     /// Gets a vector from the index (useful for tests)
     /// Returns dequantized f32 values for quantized indexes.
     pub fn get_vector(&self, idx: usize) -> Vec<f32> {
@@ -744,7 +892,67 @@ where
                 let f16_values: &[f16] = bytemuck::cast_slice(bytes);
                 f16_values.iter().map(|v| v.to_f32()).collect()
             }
-            _ => panic!("Unsupported quantization type: {:?}", self.quantization),
+            QuantizationType::Int8 => {
+                // Read per-vector scale parameters (min, max) with bounds checking
+                let scales_offset = match self.scales_offset {
+                    Some(off) => off,
+                    None => return Vec::new(), // No scales offset means corrupted Int8 index
+                };
+
+                // Use checked arithmetic to prevent overflow
+                let scale_byte_offset = match (idx as u64).checked_mul(8) {
+                    Some(v) => v,
+                    None => return Vec::new(),
+                };
+                let scale_start = match scales_offset.checked_add(scale_byte_offset) {
+                    Some(v) => v as usize,
+                    None => return Vec::new(),
+                };
+                let scale_end = scale_start.saturating_add(8);
+
+                // Bounds check before accessing mmap
+                if scale_end > self.mmap.len() {
+                    return Vec::new();
+                }
+
+                let min = match self.mmap[scale_start..scale_start + 4].try_into() {
+                    Ok(b) => f32::from_le_bytes(b),
+                    Err(_) => return Vec::new(),
+                };
+                let max = match self.mmap[scale_start + 4..scale_start + 8].try_into() {
+                    Ok(b) => f32::from_le_bytes(b),
+                    Err(_) => return Vec::new(),
+                };
+
+                // Validate min/max are finite
+                if !min.is_finite() || !max.is_finite() {
+                    return Vec::new();
+                }
+
+                let range = if max > min { max - min } else { 1.0 };
+
+                // Read quantized codes (1 byte per element) with bounds checking
+                let vec_byte_offset = match (idx as u64).checked_mul(self.dim as u64) {
+                    Some(v) => v,
+                    None => return Vec::new(),
+                };
+                let vec_start = match self.vectors_offset.checked_add(vec_byte_offset) {
+                    Some(v) => v as usize,
+                    None => return Vec::new(),
+                };
+                let vec_end = vec_start.saturating_add(self.dim);
+
+                // Bounds check before accessing mmap
+                if vec_end > self.mmap.len() {
+                    return Vec::new();
+                }
+
+                let codes = &self.mmap[vec_start..vec_end];
+
+                // Dequantize
+                codes.iter().map(|&c| c as f32 / 255.0 * range + min).collect()
+            }
+            _ => Vec::new(), // Return empty vector for unsupported quantization instead of panic
         }
     }
 
@@ -788,6 +996,7 @@ where
             distance_name: self.distance_name.clone(),
             version: MetadataV2::CURRENT_VERSION,
             quantization: self.quantization,
+            scales_offset: self.scales_offset,
         };
 
         // Serialize metadata
@@ -795,10 +1004,11 @@ where
         let md_len = md_bytes.len() as u64;
 
         // Calculate bytes per vector based on quantization
-        let bytes_per_element = match self.quantization {
+        let bytes_per_element: u64 = match self.quantization {
             QuantizationType::F32 => 4,
             QuantizationType::F16 => 2,
-            _ => 4, // fallback
+            QuantizationType::Int8 => 1,
+            QuantizationType::Int4 => 1, // fallback (not yet supported)
         };
 
         // Calculate total size
@@ -814,6 +1024,15 @@ where
 
         // Write metadata
         buffer[8..8 + md_bytes.len()].copy_from_slice(&md_bytes);
+
+        // Copy scales section if present (Int8)
+        if let Some(scales_offset) = self.scales_offset {
+            let scales_start = scales_offset as usize;
+            let scales_bytes = (self.num_vectors as u64) * 8; // 8 bytes per vector (min + max)
+            let scales_end = scales_start + scales_bytes as usize;
+            buffer[scales_start..scales_end]
+                .copy_from_slice(&self.mmap[scales_start..scales_end]);
+        }
 
         // Copy vectors from mmap
         let vectors_start = self.vectors_offset as usize;
@@ -884,6 +1103,8 @@ where
     pub(crate) vectors_offset: u64,
     /// Offset to adjacency data
     pub(crate) adjacency_offset: u64,
+    /// Offset to per-vector scaling parameters (Int8/Int4 only)
+    pub(crate) scales_offset: Option<u64>,
 
     /// Borrowed byte storage
     pub(crate) storage: ByteStorage<'a>,
@@ -971,6 +1192,7 @@ where
             medoid_id: metadata.medoid_id,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
+            scales_offset: metadata.scales_offset,
             storage: ByteStorage::Borrowed(bytes),
             dist,
         })
@@ -992,7 +1214,7 @@ where
     }
 
     /// Computes distance between `query` and vector at `idx`
-    /// Handles both F32 (zero-copy) and F16 (with dequantization) vectors.
+    /// Handles F32 (zero-copy), F16, and Int8 (with dequantization) vectors.
     fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
         match self.quantization {
             QuantizationType::F32 => {
@@ -1017,7 +1239,78 @@ where
                     self.dist.eval(query, &buf)
                 })
             }
-            _ => panic!("Unsupported quantization type: {:?}", self.quantization),
+            QuantizationType::Int8 => {
+                // Read per-vector scale parameters (min, max) with bounds checking
+                let scales_offset = match self.scales_offset {
+                    Some(off) => off,
+                    None => return f32::MAX, // No scales offset means corrupted Int8 index
+                };
+
+                let data = self.bytes();
+
+                // Use checked arithmetic to prevent overflow
+                let scale_byte_offset = match (idx as u64).checked_mul(8) {
+                    Some(v) => v,
+                    None => return f32::MAX,
+                };
+                let scale_start = match scales_offset.checked_add(scale_byte_offset) {
+                    Some(v) => v as usize,
+                    None => return f32::MAX,
+                };
+                let scale_end = scale_start.saturating_add(8);
+
+                // Bounds check before accessing data
+                if scale_end > data.len() {
+                    return f32::MAX;
+                }
+
+                let min = f32::from_le_bytes(
+                    match data[scale_start..scale_start + 4].try_into() {
+                        Ok(b) => b,
+                        Err(_) => return f32::MAX,
+                    }
+                );
+                let max = f32::from_le_bytes(
+                    match data[scale_start + 4..scale_start + 8].try_into() {
+                        Ok(b) => b,
+                        Err(_) => return f32::MAX,
+                    }
+                );
+
+                // Validate min/max are finite
+                if !min.is_finite() || !max.is_finite() {
+                    return f32::MAX;
+                }
+
+                let range = if max > min { max - min } else { 1.0 };
+
+                // Read quantized codes (1 byte per element) with bounds checking
+                let vec_byte_offset = match (idx as u64).checked_mul(self.dim as u64) {
+                    Some(v) => v,
+                    None => return f32::MAX,
+                };
+                let vec_start = match self.vectors_offset.checked_add(vec_byte_offset) {
+                    Some(v) => v as usize,
+                    None => return f32::MAX,
+                };
+                let vec_end = vec_start.saturating_add(self.dim);
+
+                // Bounds check before accessing data
+                if vec_end > data.len() {
+                    return f32::MAX;
+                }
+
+                let codes = &data[vec_start..vec_end];
+
+                // Dequantize into thread-local buffer
+                DECODE_BUFFER.with(|buf| {
+                    let mut buf = buf.borrow_mut();
+                    buf.clear();
+                    buf.extend(codes.iter().map(|&c| c as f32 / 255.0 * range + min));
+                    self.dist.eval(query, &buf)
+                })
+            }
+            _ => f32::MAX, // Return MAX distance for unsupported quantization instead of panic
         }
     }
 
@@ -1041,7 +1334,69 @@ where
                 let f16_values: &[f16] = bytemuck::cast_slice(bytes);
                 f16_values.iter().map(|v| v.to_f32()).collect()
             }
-            _ => panic!("Unsupported quantization type: {:?}", self.quantization),
+            QuantizationType::Int8 => {
+                // Read per-vector scale parameters (min, max) with bounds checking
+                let scales_offset = match self.scales_offset {
+                    Some(off) => off,
+                    None => return Vec::new(), // No scales offset means corrupted Int8 index
+                };
+
+                let data = self.bytes();
+
+                // Use checked arithmetic to prevent overflow
+                let scale_byte_offset = match (idx as u64).checked_mul(8) {
+                    Some(v) => v,
+                    None => return Vec::new(),
+                };
+                let scale_start = match scales_offset.checked_add(scale_byte_offset) {
+                    Some(v) => v as usize,
+                    None => return Vec::new(),
+                };
+                let scale_end = scale_start.saturating_add(8);
+
+                // Bounds check before accessing data
+                if scale_end > data.len() {
+                    return Vec::new();
+                }
+
+                let min = match data[scale_start..scale_start + 4].try_into() {
+                    Ok(b) => f32::from_le_bytes(b),
+                    Err(_) => return Vec::new(),
+                };
+                let max = match data[scale_start + 4..scale_start + 8].try_into() {
+                    Ok(b) => f32::from_le_bytes(b),
+                    Err(_) => return Vec::new(),
+                };
+
+                // Validate min/max are finite
+                if !min.is_finite() || !max.is_finite() {
+                    return Vec::new();
+                }
+
+                let range = if max > min { max - min } else { 1.0 };
+
+                // Read quantized codes (1 byte per element) with bounds checking
+                let vec_byte_offset = match (idx as u64).checked_mul(self.dim as u64) {
+                    Some(v) => v,
+                    None => return Vec::new(),
+                };
+                let vec_start = match self.vectors_offset.checked_add(vec_byte_offset) {
+                    Some(v) => v as usize,
+                    None => return Vec::new(),
+                };
+                let vec_end = vec_start.saturating_add(self.dim);
+
+                // Bounds check before accessing data
+                if vec_end > data.len() {
+                    return Vec::new();
+                }
+
+                let codes = &data[vec_start..vec_end];
+
+                // Dequantize
+                codes.iter().map(|&c| c as f32 / 255.0 * range + min).collect()
+            }
+            _ => Vec::new(), // Return empty vector for unsupported quantization instead of panic
         }
     }
 
@@ -1708,6 +2063,298 @@ mod tests {
         let q = vec![1.0, 0.0, 0.0];
         let results = loaded.search(&q, 1, 8);
         assert_eq!(results.len(), 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    // =========================================================================
+    // Int8 Quantization Tests
+    // =========================================================================
+
+    #[test]
+    fn test_int8_build_and_search() {
+        let path = "test_int8_basic.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 1.0],
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 4,
+                build_beam_width: 8,
+                alpha: 1.2,
+                quantization: QuantizationType::Int8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(index.quantization, QuantizationType::Int8);
+        assert_eq!(index.num_vectors, 5);
+
+        // Search should work
+        let q = vec![0.1, 0.1, 0.1];
+        let results = index.search(&q, 3, 8);
+        assert_eq!(results.len(), 3);
+
+        // First result should be close to origin
+        assert!(results.contains(&0));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_int8_constant_vector() {
+        // Test case where all elements have the same value (range = 0)
+        let path = "test_int8_constant.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![5.0, 5.0, 5.0], // All same value
+            vec![1.0, 1.0, 1.0], // All same value
+            vec![0.0, 0.0, 0.0], // All zeros
+            vec![1.0, 2.0, 3.0], // Normal vector
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 4,
+                build_beam_width: 8,
+                alpha: 1.2,
+                quantization: QuantizationType::Int8,
+            },
+        )
+        .unwrap();
+
+        // Get vectors back - constant vectors should dequantize reasonably
+        let v0 = index.get_vector(0);
+        let v1 = index.get_vector(1);
+        let v2 = index.get_vector(2);
+
+        // Constant vectors: all elements should be the same (or very close)
+        assert!((v0[0] - v0[1]).abs() < 0.1);
+        assert!((v0[1] - v0[2]).abs() < 0.1);
+        assert!((v1[0] - v1[1]).abs() < 0.1);
+        assert!((v2[0] - v2[1]).abs() < 0.1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_int8_rejects_nan_vectors() {
+        let path = "test_int8_nan.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![f32::NAN, 2.0, 3.0], // Contains NaN
+            vec![4.0, 5.0, 6.0],
+        ];
+
+        let result = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 4,
+                build_beam_width: 8,
+                alpha: 1.2,
+                quantization: QuantizationType::Int8,
+            },
+        );
+
+        assert!(result.is_err());
+        match result {
+            Err(DiskAnnError::DataError(msg)) => {
+                assert!(msg.contains("non-finite"));
+                assert!(msg.contains("Vector 1"));
+            }
+            _ => panic!("Expected DataError for NaN vector"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_int8_rejects_inf_vectors() {
+        let path = "test_int8_inf.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![4.0, f32::INFINITY, 6.0], // Contains Infinity
+        ];
+
+        let result = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 4,
+                build_beam_width: 8,
+                alpha: 1.2,
+                quantization: QuantizationType::Int8,
+            },
+        );
+
+        assert!(result.is_err());
+        match result {
+            Err(DiskAnnError::DataError(msg)) => {
+                assert!(msg.contains("non-finite"));
+            }
+            _ => panic!("Expected DataError for Inf vector"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_int8_extreme_values() {
+        // Test with very large and very small finite values
+        let path = "test_int8_extreme.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![1e10, -1e10, 0.0],
+            vec![1e-10, 1e-10, 1e-10],
+            vec![-1e10, 1e10, 0.0],
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 4,
+                build_beam_width: 8,
+                alpha: 1.2,
+                quantization: QuantizationType::Int8,
+            },
+        )
+        .unwrap();
+
+        // Should be able to get vectors back
+        let v0 = index.get_vector(0);
+        assert_eq!(v0.len(), 3);
+
+        // Search should still work
+        let results = index.search(&vectors[0], 2, 8);
+        assert!(!results.is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_int8_get_vector_roundtrip() {
+        let path = "test_int8_roundtrip.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![0.0, 0.5, 1.0],
+            vec![0.25, 0.5, 0.75],
+            vec![-1.0, 0.0, 1.0],
+            vec![100.0, 200.0, 300.0],
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 4,
+                build_beam_width: 8,
+                alpha: 1.2,
+                quantization: QuantizationType::Int8,
+            },
+        )
+        .unwrap();
+
+        // Check that dequantized vectors are reasonably close to originals
+        for (i, orig) in vectors.iter().enumerate() {
+            let reconstructed = index.get_vector(i);
+            assert_eq!(reconstructed.len(), orig.len());
+
+            // Int8 quantization should have max error of ~1% of the range
+            let range = orig.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                - orig.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_error = if range > 0.0 { range / 255.0 * 2.0 } else { 0.1 };
+
+            for (j, (&o, &r)) in orig.iter().zip(reconstructed.iter()).enumerate() {
+                let error = (o - r).abs();
+                assert!(
+                    error <= max_error,
+                    "Vector {}, element {}: original={}, reconstructed={}, error={}, max_error={}",
+                    i, j, o, r, error, max_error
+                );
+            }
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_int8_to_bytes_roundtrip() {
+        let path = "test_int8_bytes.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![1.0, 1.0, 1.0],
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 4,
+                build_beam_width: 8,
+                alpha: 1.2,
+                quantization: QuantizationType::Int8,
+            },
+        )
+        .unwrap();
+
+        // Serialize and reload
+        let bytes = index.to_bytes().unwrap();
+        let loaded = DiskANNRef::<DistL2>::from_bytes(&bytes, DistL2 {}).unwrap();
+
+        assert_eq!(loaded.quantization, QuantizationType::Int8);
+        assert_eq!(loaded.num_vectors, index.num_vectors);
+        assert_eq!(loaded.dim, index.dim);
+
+        // Vectors should match
+        for i in 0..vectors.len() {
+            let orig = index.get_vector(i);
+            let from_bytes = loaded.get_vector(i);
+            assert_eq!(orig.len(), from_bytes.len());
+            for (j, (&o, &b)) in orig.iter().zip(from_bytes.iter()).enumerate() {
+                assert!(
+                    (o - b).abs() < 0.01,
+                    "Vector {}, element {}: orig={}, bytes={}",
+                    i, j, o, b
+                );
+            }
+        }
+
+        // Search results should match
+        let q = vec![0.5, 0.5, 0.5];
+        let orig_results = index.search(&q, 3, 8);
+        let bytes_results = loaded.search(&q, 3, 8);
+        assert_eq!(orig_results, bytes_results);
 
         let _ = fs::remove_file(path);
     }
