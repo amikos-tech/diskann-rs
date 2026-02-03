@@ -1514,6 +1514,12 @@ fn calculate_medoid<D: Distance<f32> + Copy + Sync>(vectors: &[Vec<f32>], dist: 
         *val /= vectors.len() as f32;
     }
 
+    // Normalize centroid for non-L2 metrics (required for dot product)
+    let type_name = std::any::type_name::<D>();
+    if !type_name.contains("L2") {
+        simd::normalize_vector(&mut centroid);
+    }
+
     let (best_idx, _best_dist) = vectors
         .par_iter()
         .enumerate()

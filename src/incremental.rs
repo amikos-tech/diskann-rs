@@ -204,6 +204,12 @@ impl DeltaLayer {
             *val /= self.vectors.len() as f32;
         }
 
+        // Normalize centroid for non-L2 metrics (required for dot product)
+        let type_name = std::any::type_name::<D>();
+        if !type_name.contains("L2") {
+            crate::simd::normalize_vector(&mut centroid);
+        }
+
         // Find closest to centroid
         let (best_idx, _) = self.vectors
             .iter()

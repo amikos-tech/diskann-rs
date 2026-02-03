@@ -413,6 +413,22 @@ pub fn norm_squared(a: &[f32]) -> f32 {
     norm_squared_scalar(a)
 }
 
+/// Normalizes a vector in-place to unit length.
+/// Returns true if successful, false if zero norm.
+#[inline]
+pub fn normalize_vector(v: &mut [f32]) -> bool {
+    let norm_sq = norm_squared(v);
+    if norm_sq > 0.0 {
+        let inv_norm = 1.0 / norm_sq.sqrt();
+        for x in v.iter_mut() {
+            *x *= inv_norm;
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Compute cosine distance with best available SIMD
 /// Returns 1 - cosine_similarity, so 0 = identical, 2 = opposite
 #[inline]
