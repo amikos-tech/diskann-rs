@@ -3,7 +3,7 @@
 
 use anndists::dist::DistL2;
 use cpu_time::ProcessTime;
-use diskann_rs::{DiskANN, DiskAnnError, DiskAnnParams};
+use ami_diskann::{DiskANN, DiskAnnError, DiskAnnParams};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};

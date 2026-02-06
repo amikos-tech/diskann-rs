@@ -1,10 +1,10 @@
 [package]
-name = "diskann-rs"
-version = "0.3.4"
+name = "ami-diskann"
+version = "0.1.0"
 edition = "2021"
-description = "A Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search) using the Vamana graph algorithm. Provides memory-efficient vector search through graph traversal and memory-mapped storage, enabling billion-scale search with minimal RAM usage."
-license = "MIT" 
-repository = "https://github.com/lukaesch/diskann-rs"
+description = "A DiskANN-based vector search library with scalar quantization (F16, per-dimension Int8), zero-copy loading, filtered search, and composable VectorQuantizer trait. Built on the Vamana graph algorithm with memory-mapped storage."
+license = "MIT"
+repository = "https://github.com/amikos-tech/ami-diskann"
 
 [dependencies]
 rand = "0.8"

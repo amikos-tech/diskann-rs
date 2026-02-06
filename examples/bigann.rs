@@ -13,7 +13,7 @@
 
 use anndists::dist::DistL2;
 use byteorder::{LittleEndian, ReadBytesExt};
-use diskann_rs::{DiskANN, DiskAnnParams};
+use ami_diskann::{DiskANN, DiskAnnParams};
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
@@ -37,7 +37,7 @@ const DISKANN_PARAMS: DiskAnnParams = DiskAnnParams {
     max_degree: 48,
     build_beam_width: 200,
     alpha: 1.2,
-    quantization: diskann_rs::QuantizationType::F32,
+    quantization: ami_diskann::QuantizationType::F32,
 };
 const BEAM_SEARCH: usize = 512;
 

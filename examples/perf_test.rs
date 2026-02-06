@@ -1,6 +1,6 @@
 // examples/perf_test.rs
 use anndists::dist::DistCosine; // swap to DistL2/DistDot/etc. if desired
-use diskann_rs::{DiskANN, DiskAnnError, DiskAnnParams};
+use ami_diskann::{DiskANN, DiskAnnError, DiskAnnParams};
 use rand::prelude::*;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
@@ -42,7 +42,7 @@ fn main() -> Result<(), DiskAnnError> {
             max_degree: MAX_DEGREE,
             build_beam_width: BUILD_BEAM_WIDTH,
             alpha: ALPHA,
-            quantization: diskann_rs::QuantizationType::F32,
+            quantization: ami_diskann::QuantizationType::F32,
         };
 
         // Distance type must be the same for build and open

@@ -9,7 +9,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use diskann_rs::benchmark::{generate_small_benchmark, calculate_recall};
+//! use ami_diskann::benchmark::{generate_small_benchmark, calculate_recall};
 //!
 //! // Generate synthetic data with ground truth
 //! let data = generate_small_benchmark(42);

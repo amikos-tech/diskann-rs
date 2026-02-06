@@ -29,7 +29,7 @@
 //!
 //! ```no_run
 //! use anndists::dist::DistL2;
-//! use diskann_rs::{IncrementalDiskANN, DiskAnnParams};
+//! use ami_diskann::{IncrementalDiskANN, DiskAnnParams};
 //!
 //! // Build initial index
 //! let vectors = vec![vec![0.0; 128]; 1000];

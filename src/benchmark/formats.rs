@@ -12,7 +12,7 @@ use std::path::Path;
 ///
 /// # Example
 /// ```no_run
-/// use diskann_rs::benchmark::read_fvecs;
+/// use ami_diskann::benchmark::read_fvecs;
 /// let vectors = read_fvecs("sift_base.fvecs").unwrap();
 /// ```
 pub fn read_fvecs(path: impl AsRef<Path>) -> std::io::Result<Vec<Vec<f32>>> {

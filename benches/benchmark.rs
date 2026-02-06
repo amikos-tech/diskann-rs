@@ -11,7 +11,7 @@
 //! Run with: cargo bench --bench benchmark
 
 use anndists::dist::DistL2;
-use diskann_rs::{DiskANN, DiskAnnParams, IncrementalDiskANN};
+use ami_diskann::{DiskANN, DiskAnnParams, IncrementalDiskANN};
 use rand::prelude::*;
 use rayon::prelude::*;
 use std::fs;

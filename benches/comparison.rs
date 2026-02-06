@@ -9,7 +9,7 @@
 //! Run with: cargo bench --release --bench comparison
 
 use anndists::dist::DistL2;
-use diskann_rs::{DiskANN, DiskAnnParams, IncrementalDiskANN};
+use ami_diskann::{DiskANN, DiskAnnParams, IncrementalDiskANN};
 use hnsw_rs::prelude::*;
 use plotters::prelude::*;
 use rand::prelude::*;
