@@ -15,7 +15,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use diskann_rs::pq::{ProductQuantizer, PQConfig};
+//! use ami_diskann::pq::{ProductQuantizer, PQConfig};
 //!
 //! // Train a quantizer on sample vectors
 //! let vectors: Vec<Vec<f32>> = load_your_training_data();
@@ -35,6 +35,7 @@
 //! For search, we compute exact query-to-centroid distances once,
 //! then use a lookup table for fast distance approximation.
 
+use crate::sq::VectorQuantizer;
 use crate::DiskAnnError;
 use rand::prelude::*;
 use rayon::prelude::*;
@@ -288,6 +289,25 @@ impl ProductQuantizer {
             code_size_bytes: self.num_subspaces,
             compression_ratio: (self.dim * 4) as f32 / self.num_subspaces as f32,
         }
+    }
+}
+
+impl VectorQuantizer for ProductQuantizer {
+    fn encode(&self, vector: &[f32]) -> Vec<u8> {
+        ProductQuantizer::encode(self, vector)
+    }
+
+    fn decode(&self, codes: &[u8]) -> Vec<f32> {
+        ProductQuantizer::decode(self, codes)
+    }
+
+    fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 {
+        ProductQuantizer::asymmetric_distance(self, query, codes)
+    }
+
+    fn compression_ratio(&self, _dim: usize) -> f32 {
+        let stats = self.stats();
+        stats.compression_ratio
     }
 }
 

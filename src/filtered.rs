@@ -24,7 +24,7 @@
 //!
 //! ```ignore
 //! use anndists::dist::DistL2;
-//! use diskann_rs::{FilteredDiskANN, Filter};
+//! use ami_diskann::{FilteredDiskANN, Filter};
 //!
 //! // Build index with metadata
 //! let vectors = vec![vec![0.0; 128]; 1000];
@@ -501,22 +501,11 @@ where
     }
 
     fn get_neighbors(&self, node_id: u32) -> &[u32] {
-        // Access internal neighbors through the index
-        let offset = self.index.adjacency_offset
-            + (node_id as u64 * self.index.max_degree as u64 * 4);
-        let start = offset as usize;
-        let end = start + (self.index.max_degree * 4);
-        let bytes = &self.index.mmap[start..end];
-        bytemuck::cast_slice(bytes)
+        self.index.get_neighbors(node_id)
     }
 
     fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
-        let offset = self.index.vectors_offset + (idx as u64 * self.index.dim as u64 * 4);
-        let start = offset as usize;
-        let end = start + (self.index.dim * 4);
-        let bytes = &self.index.mmap[start..end];
-        let vector: &[f32] = bytemuck::cast_slice(bytes);
-        self.index.dist.eval(query, vector)
+        self.index.distance_to(query, idx)
     }
 }
 
@@ -667,6 +656,59 @@ mod tests {
         let results = index.search_filtered(&[25.0, 25.0], 5, 32, &filter);
         for id in &results {
             assert_eq!(index.get_labels(*id as usize).unwrap()[0], 1);
+        }
+
+        let _ = fs::remove_file(format!("{}.idx", base_path));
+        let _ = fs::remove_file(format!("{}.labels", base_path));
+    }
+
+    #[test]
+    fn test_filtered_int8_search() {
+        let base_path = "test_filtered_int8";
+        let _ = fs::remove_file(format!("{}.idx", base_path));
+        let _ = fs::remove_file(format!("{}.labels", base_path));
+
+        let vectors: Vec<Vec<f32>> = (0..100)
+            .map(|i| vec![i as f32, (i * 2) as f32])
+            .collect();
+
+        let labels: Vec<Vec<u64>> = (0..100).map(|i| vec![i % 5]).collect();
+
+        let index = FilteredDiskANN::<DistL2>::build_with_params(
+            &vectors,
+            &labels,
+            base_path,
+            crate::DiskAnnParams {
+                max_degree: 16,
+                build_beam_width: 32,
+                alpha: 1.2,
+                quantization: crate::QuantizationType::Int8,
+            },
+        )
+        .unwrap();
+
+        // Unfiltered search should work with Int8
+        let results = index.search(&[50.0, 100.0], 5, 32);
+        assert_eq!(results.len(), 5);
+
+        // Filtered search should work with Int8
+        let filter = Filter::label_eq(0, 0);
+        let results = index.search_filtered(&[50.0, 100.0], 5, 32, &filter);
+
+        for id in &results {
+            assert_eq!(labels[*id as usize][0], 0);
+        }
+
+        // Verify distances are reasonable (not f32::MAX or garbage)
+        let results_with_dists =
+            index.search_filtered_with_dists(&[50.0, 100.0], 5, 32, &filter);
+        for (id, dist) in &results_with_dists {
+            assert!(
+                *dist < f32::MAX,
+                "Distance for id {} should not be f32::MAX",
+                id
+            );
+            assert!(dist.is_finite(), "Distance for id {} should be finite", id);
         }
 
         let _ = fs::remove_file(format!("{}.idx", base_path));

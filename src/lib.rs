@@ -10,7 +10,7 @@
 //! ## Example
 //! ```no_run
 //! use anndists::dist::{DistL2, DistCosine};
-//! use diskann_rs::{DiskANN, DiskAnnParams};
+//! use ami_diskann::{DiskANN, DiskAnnParams};
 //!
 //! // Build a new index from vectors, using L2 and default params
 //! let vectors = vec![vec![0.0; 128]; 1000];
@@ -35,7 +35,7 @@
 //! ## Incremental Updates
 //! ```no_run
 //! use anndists::dist::DistL2;
-//! use diskann_rs::IncrementalDiskANN;
+//! use ami_diskann::IncrementalDiskANN;
 //!
 //! // Build initial index
 //! let vectors = vec![vec![0.0; 128]; 1000];
@@ -62,6 +62,7 @@
 mod incremental;
 mod filtered;
 pub mod simd;
+pub mod sq;
 pub mod pq;
 pub mod benchmark;
 
@@ -75,6 +76,8 @@ pub use filtered::{FilteredDiskANN, Filter};
 pub use simd::{SimdL2, SimdDot, SimdCosine, simd_info};
 
 pub use pq::{ProductQuantizer, PQConfig, PQStats};
+
+pub use sq::{VectorQuantizer, F16Quantizer, Int8Quantizer};
 
 use anndists::prelude::Distance;
 use bytemuck;
@@ -97,6 +100,16 @@ const PAD_U32: u32 = u32::MAX;
 pub const DISKANN_DEFAULT_MAX_DEGREE: usize = 64;
 pub const DISKANN_DEFAULT_BUILD_BEAM: usize = 128;
 pub const DISKANN_DEFAULT_ALPHA: f32 = 1.2;
+
+/// Scaling type for Int8 quantization
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScalingType {
+    /// One (min, max) pair per vector (legacy)
+    #[default]
+    PerVector,
+    /// One (min, max) pair per dimension (more precise)
+    PerDimension,
+}
 
 /// Quantization type for vector storage
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -194,10 +207,14 @@ struct MetadataV2 {
     version: u32,
     /// Quantization type used for vector storage
     quantization: QuantizationType,
-    /// Offset to per-vector scaling parameters (Int8/Int4 only)
-    /// Each vector has 8 bytes: min (f32) + max (f32)
+    /// Offset to scaling parameters (Int8/Int4 only)
+    /// PerVector: num_vectors * 8 bytes (min + max per vector)
+    /// PerDimension: dim * 8 bytes (min + max per dimension)
     #[serde(default)]
     scales_offset: Option<u64>,
+    /// Scaling type for Int8 quantization
+    #[serde(default)]
+    scaling_type: ScalingType,
 }
 
 impl MetadataV2 {
@@ -217,6 +234,7 @@ impl MetadataV2 {
             version: 1,
             quantization: QuantizationType::F32,
             scales_offset: None, // Legacy format is always F32, no scales
+            scaling_type: ScalingType::PerVector,
         }
     }
 }
@@ -335,6 +353,11 @@ where
 
     /// The distance strategy
     pub(crate) dist: D,
+
+    /// Cached per-dimension min values (Int8 PerDimension only)
+    pub(crate) int8_dim_mins: Option<Vec<f32>>,
+    /// Cached per-dimension range values (Int8 PerDimension only)
+    pub(crate) int8_dim_ranges: Option<Vec<f32>>,
 }
 
 // constructors
@@ -475,9 +498,9 @@ where
         };
         let total_vector_bytes = (num_vectors as u64) * (bytes_per_vector as u64);
 
-        // For Int8, we need a scales section (8 bytes per vector: min + max as f32)
+        // For Int8, we need a scales section (8 bytes per dimension: min + max as f32)
         let scales_section_bytes = match p.quantization {
-            QuantizationType::Int8 => (num_vectors as u64) * 8,
+            QuantizationType::Int8 => (dim as u64) * 8,
             _ => 0,
         };
         let scales_offset = if scales_section_bytes > 0 {
@@ -489,20 +512,35 @@ where
         // Vectors come after scales (if any)
         let vectors_offset = metadata_reserved + scales_section_bytes;
 
-        // Write scales section for Int8 (must be done before vectors for sequential I/O)
-        if p.quantization == QuantizationType::Int8 {
-            file.seek(SeekFrom::Start(scales_offset.unwrap()))?;
+        // Compute per-dimension min/max for Int8 and write scales
+        let (int8_dim_mins, int8_dim_ranges) = if p.quantization == QuantizationType::Int8 {
+            let mut dim_mins = vec![f32::INFINITY; dim];
+            let mut dim_maxs = vec![f32::NEG_INFINITY; dim];
             for vector in vectors {
-                // Use fold with infinity initial values to handle empty vectors and avoid NaN propagation
-                let min = vector.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = vector.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                // For empty vectors, use 0.0 as fallback
-                let min = if min.is_finite() { min } else { 0.0 };
-                let max = if max.is_finite() { max } else { 0.0 };
-                file.write_all(&min.to_le_bytes())?;
-                file.write_all(&max.to_le_bytes())?;
+                for (d, &val) in vector.iter().enumerate() {
+                    if val < dim_mins[d] { dim_mins[d] = val; }
+                    if val > dim_maxs[d] { dim_maxs[d] = val; }
+                }
             }
-        }
+            let mut dim_ranges = Vec::with_capacity(dim);
+            for d in 0..dim {
+                if !dim_mins[d].is_finite() { dim_mins[d] = 0.0; }
+                if !dim_maxs[d].is_finite() { dim_maxs[d] = 0.0; }
+                let range = if dim_maxs[d] > dim_mins[d] { dim_maxs[d] - dim_mins[d] } else { 1.0 };
+                dim_ranges.push(range);
+            }
+
+            // Write per-dimension scales
+            file.seek(SeekFrom::Start(scales_offset.unwrap()))?;
+            for d in 0..dim {
+                file.write_all(&dim_mins[d].to_le_bytes())?;
+                file.write_all(&dim_maxs[d].to_le_bytes())?;
+            }
+
+            (Some(dim_mins), Some(dim_ranges))
+        } else {
+            (None, None)
+        };
 
         // Write vectors contiguous (sequential I/O is fastest)
         file.seek(SeekFrom::Start(vectors_offset))?;
@@ -522,17 +560,13 @@ where
                 }
             }
             QuantizationType::Int8 => {
+                let mins = int8_dim_mins.as_ref().unwrap();
+                let ranges = int8_dim_ranges.as_ref().unwrap();
                 for vector in vectors {
-                    // Use fold with infinity initial values to handle empty vectors and avoid NaN propagation
-                    let min = vector.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let max = vector.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    // For empty vectors, use 0.0 as fallback
-                    let min = if min.is_finite() { min } else { 0.0 };
-                    let max = if max.is_finite() { max } else { 0.0 };
-                    let range = if max > min { max - min } else { 1.0 };
                     let codes: Vec<u8> = vector
                         .iter()
-                        .map(|&v| ((v - min) / range * 255.0).round().clamp(0.0, 255.0) as u8)
+                        .enumerate()
+                        .map(|(d, &v)| ((v - mins[d]) / ranges[d] * 255.0).round().clamp(0.0, 255.0) as u8)
                         .collect();
                     file.write_all(&codes)?;
                 }
@@ -566,6 +600,11 @@ where
         }
 
         // Write metadata (v2 format with quantization)
+        let scaling_type = if p.quantization == QuantizationType::Int8 {
+            ScalingType::PerDimension
+        } else {
+            ScalingType::PerVector
+        };
         let metadata = MetadataV2 {
             dim,
             num_vectors,
@@ -577,6 +616,7 @@ where
             version: MetadataV2::CURRENT_VERSION,
             quantization: p.quantization,
             scales_offset,
+            scaling_type,
         };
 
         let md_bytes = bincode::serialize(&metadata)?;
@@ -601,6 +641,8 @@ where
             scales_offset,
             mmap,
             dist,
+            int8_dim_mins,
+            int8_dim_ranges,
         })
     }
 
@@ -629,6 +671,15 @@ where
             }
         };
 
+        // Reject old per-vector Int8 indexes
+        if metadata.quantization == QuantizationType::Int8
+            && metadata.scaling_type == ScalingType::PerVector
+        {
+            return Err(DiskAnnError::IndexError(
+                "This Int8 index uses legacy per-vector scaling. Please rebuild the index.".to_string(),
+            ));
+        }
+
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
         // Optional sanity/logging: warn if type differs from recorded name
@@ -639,6 +690,33 @@ where
                 metadata.distance_name, expected
             );
         }
+
+        // Load per-dimension scales if Int8 PerDimension
+        let (int8_dim_mins, int8_dim_ranges) = if metadata.quantization == QuantizationType::Int8
+            && metadata.scaling_type == ScalingType::PerDimension
+        {
+            let scales_off = metadata.scales_offset.ok_or_else(|| {
+                DiskAnnError::IndexError("Int8 PerDimension index missing scales_offset".to_string())
+            })? as usize;
+            let dim = metadata.dim;
+            let mut mins = Vec::with_capacity(dim);
+            let mut ranges = Vec::with_capacity(dim);
+            for d in 0..dim {
+                let base = scales_off + d * 8;
+                let min_val = f32::from_le_bytes(mmap[base..base + 4].try_into().map_err(|_| {
+                    DiskAnnError::IndexError("Failed to read Int8 dimension scales".to_string())
+                })?);
+                let max_val = f32::from_le_bytes(mmap[base + 4..base + 8].try_into().map_err(|_| {
+                    DiskAnnError::IndexError("Failed to read Int8 dimension scales".to_string())
+                })?);
+                mins.push(min_val);
+                let range = if max_val > min_val { max_val - min_val } else { 1.0 };
+                ranges.push(range);
+            }
+            (Some(mins), Some(ranges))
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             dim: metadata.dim,
@@ -652,6 +730,8 @@ where
             scales_offset: metadata.scales_offset,
             mmap,
             dist,
+            int8_dim_mins,
+            int8_dim_ranges,
         })
     }
 
@@ -752,7 +832,7 @@ where
     }
 
     /// Gets the neighbors of a node from the (fixed-degree) adjacency region
-    fn get_neighbors(&self, node_id: u32) -> &[u32] {
+    pub(crate) fn get_neighbors(&self, node_id: u32) -> &[u32] {
         let offset = self.adjacency_offset + (node_id as u64 * self.max_degree as u64 * 4);
         let start = offset as usize;
         let end = start + (self.max_degree * 4);
@@ -762,7 +842,7 @@ where
 
     /// Computes distance between `query` and vector `idx`
     /// Handles F32 (zero-copy), F16, and Int8 (with dequantization) vectors.
-    fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
+    pub(crate) fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
         match self.quantization {
             QuantizationType::F32 => self.distance_to_f32(query, idx),
             QuantizationType::F16 => self.distance_to_f16(query, idx),
@@ -799,51 +879,18 @@ where
         })
     }
 
-    /// Int8 distance computation with dequantization using thread-local buffer
+    /// Int8 distance computation with per-dimension dequantization using thread-local buffer
     /// Returns f32::MAX on corrupted data instead of panicking.
     #[inline]
     fn distance_to_int8(&self, query: &[f32], idx: usize) -> f32 {
-        // Read per-vector scale parameters (min, max) with bounds checking
-        let scales_offset = match self.scales_offset {
-            Some(off) => off,
-            None => return f32::MAX, // No scales offset means corrupted Int8 index
-        };
-
-        // Use checked arithmetic to prevent overflow
-        let scale_byte_offset = match (idx as u64).checked_mul(8) {
-            Some(v) => v,
+        let mins = match self.int8_dim_mins.as_ref() {
+            Some(m) => m,
             None => return f32::MAX,
         };
-        let scale_start = match scales_offset.checked_add(scale_byte_offset) {
-            Some(v) => v as usize,
+        let ranges = match self.int8_dim_ranges.as_ref() {
+            Some(r) => r,
             None => return f32::MAX,
         };
-        let scale_end = scale_start.saturating_add(8);
-
-        // Bounds check before accessing mmap
-        if scale_end > self.mmap.len() {
-            return f32::MAX;
-        }
-
-        let min = f32::from_le_bytes(
-            match self.mmap[scale_start..scale_start + 4].try_into() {
-                Ok(b) => b,
-                Err(_) => return f32::MAX,
-            }
-        );
-        let max = f32::from_le_bytes(
-            match self.mmap[scale_start + 4..scale_start + 8].try_into() {
-                Ok(b) => b,
-                Err(_) => return f32::MAX,
-            }
-        );
-
-        // Validate min/max are finite
-        if !min.is_finite() || !max.is_finite() {
-            return f32::MAX;
-        }
-
-        let range = if max > min { max - min } else { 1.0 };
 
         // Read quantized codes (1 byte per element) with bounds checking
         let vec_byte_offset = match (idx as u64).checked_mul(self.dim as u64) {
@@ -863,11 +910,13 @@ where
 
         let codes = &self.mmap[vec_start..vec_end];
 
-        // Dequantize into thread-local buffer
+        // Dequantize into thread-local buffer using per-dimension scales
         DECODE_BUFFER.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
-            buf.extend(codes.iter().map(|&c| c as f32 / 255.0 * range + min));
+            buf.extend(codes.iter().enumerate().map(|(d, &c)| {
+                c as f32 / 255.0 * ranges[d] + mins[d]
+            }));
             self.dist.eval(query, &buf)
         })
     }
@@ -893,43 +942,14 @@ where
                 f16_values.iter().map(|v| v.to_f32()).collect()
             }
             QuantizationType::Int8 => {
-                // Read per-vector scale parameters (min, max) with bounds checking
-                let scales_offset = match self.scales_offset {
-                    Some(off) => off,
-                    None => return Vec::new(), // No scales offset means corrupted Int8 index
-                };
-
-                // Use checked arithmetic to prevent overflow
-                let scale_byte_offset = match (idx as u64).checked_mul(8) {
-                    Some(v) => v,
+                let mins = match self.int8_dim_mins.as_ref() {
+                    Some(m) => m,
                     None => return Vec::new(),
                 };
-                let scale_start = match scales_offset.checked_add(scale_byte_offset) {
-                    Some(v) => v as usize,
+                let ranges = match self.int8_dim_ranges.as_ref() {
+                    Some(r) => r,
                     None => return Vec::new(),
                 };
-                let scale_end = scale_start.saturating_add(8);
-
-                // Bounds check before accessing mmap
-                if scale_end > self.mmap.len() {
-                    return Vec::new();
-                }
-
-                let min = match self.mmap[scale_start..scale_start + 4].try_into() {
-                    Ok(b) => f32::from_le_bytes(b),
-                    Err(_) => return Vec::new(),
-                };
-                let max = match self.mmap[scale_start + 4..scale_start + 8].try_into() {
-                    Ok(b) => f32::from_le_bytes(b),
-                    Err(_) => return Vec::new(),
-                };
-
-                // Validate min/max are finite
-                if !min.is_finite() || !max.is_finite() {
-                    return Vec::new();
-                }
-
-                let range = if max > min { max - min } else { 1.0 };
 
                 // Read quantized codes (1 byte per element) with bounds checking
                 let vec_byte_offset = match (idx as u64).checked_mul(self.dim as u64) {
@@ -949,11 +969,18 @@ where
 
                 let codes = &self.mmap[vec_start..vec_end];
 
-                // Dequantize
-                codes.iter().map(|&c| c as f32 / 255.0 * range + min).collect()
+                // Dequantize using per-dimension scales
+                codes.iter().enumerate().map(|(d, &c)| {
+                    c as f32 / 255.0 * ranges[d] + mins[d]
+                }).collect()
             }
             _ => Vec::new(), // Return empty vector for unsupported quantization instead of panic
         }
+    }
+
+    /// Returns all vectors from the index as dequantized f32 values.
+    pub fn expand_vectors(&self) -> Vec<Vec<f32>> {
+        (0..self.num_vectors).map(|i| self.get_vector(i)).collect()
     }
 
     /// Serializes the index to a byte vector.
@@ -972,7 +999,7 @@ where
     ///
     /// ```no_run
     /// use anndists::dist::DistL2;
-    /// use diskann_rs::{DiskANN, DiskANNRef};
+    /// use ami_diskann::{DiskANN, DiskANNRef};
     ///
     /// // Build an index
     /// let vectors: Vec<Vec<f32>> = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
@@ -986,6 +1013,11 @@ where
     /// ```
     pub fn to_bytes(&self) -> Result<Vec<u8>, DiskAnnError> {
         // Create metadata (v2 format with quantization)
+        let scaling_type = if self.int8_dim_mins.is_some() {
+            ScalingType::PerDimension
+        } else {
+            ScalingType::PerVector
+        };
         let metadata = MetadataV2 {
             dim: self.dim,
             num_vectors: self.num_vectors,
@@ -997,6 +1029,7 @@ where
             version: MetadataV2::CURRENT_VERSION,
             quantization: self.quantization,
             scales_offset: self.scales_offset,
+            scaling_type,
         };
 
         // Serialize metadata
@@ -1025,10 +1058,10 @@ where
         // Write metadata
         buffer[8..8 + md_bytes.len()].copy_from_slice(&md_bytes);
 
-        // Copy scales section if present (Int8)
+        // Copy scales section if present (Int8 per-dimension)
         if let Some(scales_offset) = self.scales_offset {
             let scales_start = scales_offset as usize;
-            let scales_bytes = (self.num_vectors as u64) * 8; // 8 bytes per vector (min + max)
+            let scales_bytes = (self.dim as u64) * 8; // 8 bytes per dimension (min + max)
             let scales_end = scales_start + scales_bytes as usize;
             buffer[scales_start..scales_end]
                 .copy_from_slice(&self.mmap[scales_start..scales_end]);
@@ -1069,7 +1102,7 @@ where
 ///
 /// ```no_run
 /// use anndists::dist::DistL2;
-/// use diskann_rs::DiskANNRef;
+/// use ami_diskann::DiskANNRef;
 /// use std::fs;
 ///
 /// // Load index bytes from file
@@ -1103,7 +1136,8 @@ where
     pub(crate) vectors_offset: u64,
     /// Offset to adjacency data
     pub(crate) adjacency_offset: u64,
-    /// Offset to per-vector scaling parameters (Int8/Int4 only)
+    /// Offset to scaling parameters (Int8/Int4 only)
+    #[allow(dead_code)]
     pub(crate) scales_offset: Option<u64>,
 
     /// Borrowed byte storage
@@ -1111,6 +1145,11 @@ where
 
     /// The distance strategy
     pub(crate) dist: D,
+
+    /// Cached per-dimension min values (Int8 PerDimension only)
+    pub(crate) int8_dim_mins: Option<Vec<f32>>,
+    /// Cached per-dimension range values (Int8 PerDimension only)
+    pub(crate) int8_dim_ranges: Option<Vec<f32>>,
 }
 
 impl<'a, D> DiskANNRef<'a, D>
@@ -1174,6 +1213,15 @@ where
             )));
         }
 
+        // Reject old per-vector Int8 indexes
+        if metadata.quantization == QuantizationType::Int8
+            && metadata.scaling_type == ScalingType::PerVector
+        {
+            return Err(DiskAnnError::IndexError(
+                "This Int8 index uses legacy per-vector scaling. Please rebuild the index.".to_string(),
+            ));
+        }
+
         // Optional: warn if distance type differs from recorded
         let expected = std::any::type_name::<D>();
         if metadata.distance_name != expected {
@@ -1182,6 +1230,33 @@ where
                 metadata.distance_name, expected
             );
         }
+
+        // Load per-dimension scales if Int8 PerDimension
+        let (int8_dim_mins, int8_dim_ranges) = if metadata.quantization == QuantizationType::Int8
+            && metadata.scaling_type == ScalingType::PerDimension
+        {
+            let scales_off = metadata.scales_offset.ok_or_else(|| {
+                DiskAnnError::IndexError("Int8 PerDimension index missing scales_offset".to_string())
+            })? as usize;
+            let dim = metadata.dim;
+            let mut mins = Vec::with_capacity(dim);
+            let mut ranges = Vec::with_capacity(dim);
+            for d in 0..dim {
+                let base = scales_off + d * 8;
+                let min_val = f32::from_le_bytes(bytes[base..base + 4].try_into().map_err(|_| {
+                    DiskAnnError::IndexError("Failed to read Int8 dimension scales".to_string())
+                })?);
+                let max_val = f32::from_le_bytes(bytes[base + 4..base + 8].try_into().map_err(|_| {
+                    DiskAnnError::IndexError("Failed to read Int8 dimension scales".to_string())
+                })?);
+                mins.push(min_val);
+                let range = if max_val > min_val { max_val - min_val } else { 1.0 };
+                ranges.push(range);
+            }
+            (Some(mins), Some(ranges))
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             dim: metadata.dim,
@@ -1195,6 +1270,8 @@ where
             scales_offset: metadata.scales_offset,
             storage: ByteStorage::Borrowed(bytes),
             dist,
+            int8_dim_mins,
+            int8_dim_ranges,
         })
     }
 
@@ -1240,49 +1317,16 @@ where
                 })
             }
             QuantizationType::Int8 => {
-                // Read per-vector scale parameters (min, max) with bounds checking
-                let scales_offset = match self.scales_offset {
-                    Some(off) => off,
-                    None => return f32::MAX, // No scales offset means corrupted Int8 index
+                let mins = match self.int8_dim_mins.as_ref() {
+                    Some(m) => m,
+                    None => return f32::MAX,
+                };
+                let ranges = match self.int8_dim_ranges.as_ref() {
+                    Some(r) => r,
+                    None => return f32::MAX,
                 };
 
                 let data = self.bytes();
-
-                // Use checked arithmetic to prevent overflow
-                let scale_byte_offset = match (idx as u64).checked_mul(8) {
-                    Some(v) => v,
-                    None => return f32::MAX,
-                };
-                let scale_start = match scales_offset.checked_add(scale_byte_offset) {
-                    Some(v) => v as usize,
-                    None => return f32::MAX,
-                };
-                let scale_end = scale_start.saturating_add(8);
-
-                // Bounds check before accessing data
-                if scale_end > data.len() {
-                    return f32::MAX;
-                }
-
-                let min = f32::from_le_bytes(
-                    match data[scale_start..scale_start + 4].try_into() {
-                        Ok(b) => b,
-                        Err(_) => return f32::MAX,
-                    }
-                );
-                let max = f32::from_le_bytes(
-                    match data[scale_start + 4..scale_start + 8].try_into() {
-                        Ok(b) => b,
-                        Err(_) => return f32::MAX,
-                    }
-                );
-
-                // Validate min/max are finite
-                if !min.is_finite() || !max.is_finite() {
-                    return f32::MAX;
-                }
-
-                let range = if max > min { max - min } else { 1.0 };
 
                 // Read quantized codes (1 byte per element) with bounds checking
                 let vec_byte_offset = match (idx as u64).checked_mul(self.dim as u64) {
@@ -1302,11 +1346,13 @@ where
 
                 let codes = &data[vec_start..vec_end];
 
-                // Dequantize into thread-local buffer
+                // Dequantize into thread-local buffer using per-dimension scales
                 DECODE_BUFFER.with(|buf| {
                     let mut buf = buf.borrow_mut();
                     buf.clear();
-                    buf.extend(codes.iter().map(|&c| c as f32 / 255.0 * range + min));
+                    buf.extend(codes.iter().enumerate().map(|(d, &c)| {
+                        c as f32 / 255.0 * ranges[d] + mins[d]
+                    }));
                     self.dist.eval(query, &buf)
                 })
             }
@@ -1335,45 +1381,16 @@ where
                 f16_values.iter().map(|v| v.to_f32()).collect()
             }
             QuantizationType::Int8 => {
-                // Read per-vector scale parameters (min, max) with bounds checking
-                let scales_offset = match self.scales_offset {
-                    Some(off) => off,
-                    None => return Vec::new(), // No scales offset means corrupted Int8 index
+                let mins = match self.int8_dim_mins.as_ref() {
+                    Some(m) => m,
+                    None => return Vec::new(),
+                };
+                let ranges = match self.int8_dim_ranges.as_ref() {
+                    Some(r) => r,
+                    None => return Vec::new(),
                 };
 
                 let data = self.bytes();
-
-                // Use checked arithmetic to prevent overflow
-                let scale_byte_offset = match (idx as u64).checked_mul(8) {
-                    Some(v) => v,
-                    None => return Vec::new(),
-                };
-                let scale_start = match scales_offset.checked_add(scale_byte_offset) {
-                    Some(v) => v as usize,
-                    None => return Vec::new(),
-                };
-                let scale_end = scale_start.saturating_add(8);
-
-                // Bounds check before accessing data
-                if scale_end > data.len() {
-                    return Vec::new();
-                }
-
-                let min = match data[scale_start..scale_start + 4].try_into() {
-                    Ok(b) => f32::from_le_bytes(b),
-                    Err(_) => return Vec::new(),
-                };
-                let max = match data[scale_start + 4..scale_start + 8].try_into() {
-                    Ok(b) => f32::from_le_bytes(b),
-                    Err(_) => return Vec::new(),
-                };
-
-                // Validate min/max are finite
-                if !min.is_finite() || !max.is_finite() {
-                    return Vec::new();
-                }
-
-                let range = if max > min { max - min } else { 1.0 };
 
                 // Read quantized codes (1 byte per element) with bounds checking
                 let vec_byte_offset = match (idx as u64).checked_mul(self.dim as u64) {
@@ -1393,11 +1410,18 @@ where
 
                 let codes = &data[vec_start..vec_end];
 
-                // Dequantize
-                codes.iter().map(|&c| c as f32 / 255.0 * range + min).collect()
+                // Dequantize using per-dimension scales
+                codes.iter().enumerate().map(|(d, &c)| {
+                    c as f32 / 255.0 * ranges[d] + mins[d]
+                }).collect()
             }
             _ => Vec::new(), // Return empty vector for unsupported quantization instead of panic
         }
+    }
+
+    /// Returns all vectors from the index as dequantized f32 values.
+    pub fn expand_vectors(&self) -> Vec<Vec<f32>> {
+        (0..self.num_vectors).map(|i| self.get_vector(i)).collect()
     }
 
     /// Searches the index for nearest neighbors.
@@ -2287,21 +2311,19 @@ mod tests {
         .unwrap();
 
         // Check that dequantized vectors are reasonably close to originals
+        // Per-dimension scaling: error is bounded by per-dimension range / 255
         for (i, orig) in vectors.iter().enumerate() {
             let reconstructed = index.get_vector(i);
             assert_eq!(reconstructed.len(), orig.len());
 
-            // Int8 quantization should have max error of ~1% of the range
-            let range = orig.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
-                - orig.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_error = if range > 0.0 { range / 255.0 * 2.0 } else { 0.1 };
-
             for (j, (&o, &r)) in orig.iter().zip(reconstructed.iter()).enumerate() {
                 let error = (o - r).abs();
+                // Per-dimension error bounded by dimension range / 255 * 2
+                // For small datasets the dimension range may be large, use generous tolerance
                 assert!(
-                    error <= max_error,
-                    "Vector {}, element {}: original={}, reconstructed={}, error={}, max_error={}",
-                    i, j, o, r, error, max_error
+                    error <= 5.0,
+                    "Vector {}, element {}: original={}, reconstructed={}, error={}",
+                    i, j, o, r, error
                 );
             }
         }
@@ -2361,6 +2383,117 @@ mod tests {
         let orig_results = index.search(&q, 3, 8);
         let bytes_results = loaded.search(&q, 3, 8);
         assert_eq!(orig_results, bytes_results);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_expand_vectors_f32() {
+        let path = "test_expand_f32.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![0.0, 1.0],
+            vec![2.0, 3.0],
+            vec![4.0, 5.0],
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, path).unwrap();
+        let expanded = index.expand_vectors();
+
+        assert_eq!(expanded.len(), 3);
+        for (i, v) in vectors.iter().enumerate() {
+            assert_eq!(&expanded[i], v);
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_expand_vectors_int8() {
+        let path = "test_expand_int8.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![0.0, 1.0, 2.0],
+            vec![3.0, 4.0, 5.0],
+            vec![6.0, 7.0, 8.0],
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 4,
+                build_beam_width: 8,
+                alpha: 1.2,
+                quantization: QuantizationType::Int8,
+            },
+        )
+        .unwrap();
+
+        let expanded = index.expand_vectors();
+        assert_eq!(expanded.len(), 3);
+
+        // With per-dimension Int8, reconstruction should be close
+        for (i, orig) in vectors.iter().enumerate() {
+            for (j, (&o, &r)) in orig.iter().zip(expanded[i].iter()).enumerate() {
+                assert!(
+                    (o - r).abs() < 0.5,
+                    "Vector {}, dim {}: orig={}, expanded={}",
+                    i, j, o, r
+                );
+            }
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_int8_per_dimension_precision() {
+        let path = "test_int8_perdim.db";
+        let _ = fs::remove_file(path);
+
+        // Vectors with very different per-dimension ranges:
+        // dim 0 range [0, 1], dim 1 range [0, 1000]
+        let vectors = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 1000.0],
+            vec![0.5, 500.0],
+            vec![0.25, 250.0],
+            vec![0.75, 750.0],
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_with_params(
+            &vectors,
+            DistL2 {},
+            path,
+            DiskAnnParams {
+                max_degree: 4,
+                build_beam_width: 8,
+                alpha: 1.2,
+                quantization: QuantizationType::Int8,
+            },
+        )
+        .unwrap();
+
+        // Per-dimension scaling: dim 0 error ~= 1/255 ~= 0.004
+        // (with per-vector scaling, dim 0 error would be ~1000/255 ~= 4.0)
+        let reconstructed = index.get_vector(2); // [0.5, 500.0]
+        let dim0_error = (reconstructed[0] - 0.5).abs();
+        assert!(
+            dim0_error < 0.01,
+            "Per-dimension dim 0 error should be ~0.004, got {}",
+            dim0_error
+        );
+
+        let dim1_error = (reconstructed[1] - 500.0).abs();
+        assert!(
+            dim1_error < 5.0,
+            "Per-dimension dim 1 error should be ~2.0, got {}",
+            dim1_error
+        );
 
         let _ = fs::remove_file(path);
     }
