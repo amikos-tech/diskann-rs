@@ -162,14 +162,27 @@ impl DeltaLayer {
                 let neighbors = self.find_and_prune_neighbors(local_idx, dist);
                 self.graph[local_idx] = neighbors.clone();
 
-                // Reverse edges (make graph bidirectional-ish)
+                // Reverse edges. A full list is re-pruned with the new node
+                // included (DiskANN inter_insert), so the edge is not dropped.
                 for &nb in &neighbors {
                     let nb_idx = nb as usize;
-                    if !self.graph[nb_idx].contains(&(local_idx as u32))
-                        && self.graph[nb_idx].len() < self.max_degree
-                    {
-                        self.graph[nb_idx].push(local_idx as u32);
+                    if self.graph[nb_idx].contains(&(local_idx as u32)) {
+                        continue;
                     }
+                    if self.graph[nb_idx].len() < self.max_degree {
+                        self.graph[nb_idx].push(local_idx as u32);
+                        continue;
+                    }
+                    let pool: Vec<(u32, f32)> = self.graph[nb_idx]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(local_idx as u32))
+                        .map(|id| {
+                            let d = dist.eval(&self.vectors[nb_idx], &self.vectors[id as usize]);
+                            (id, d)
+                        })
+                        .collect();
+                    self.graph[nb_idx] = self.prune_neighbors(nb_idx, &pool, dist);
                 }
             }
 
@@ -859,5 +872,27 @@ mod tests {
         let best_vec = index.get_vector(results[0].0).unwrap();
         let dist = euclid(&best_vec, &[0.5, 0.5]);
         assert!(dist < 0.01);
+    }
+
+    fn small_degree_index(dim: usize, max_degree: usize) -> IncrementalDiskANN<DistL2> {
+        let mut config = IncrementalConfig::default();
+        config.delta_params.max_degree = max_degree;
+        IncrementalDiskANN::<DistL2>::new_empty(dim, DistL2 {}, config)
+    }
+
+    #[test]
+    fn test_delta_full_beam_reaches_nearly_every_node_at_small_degree() {
+        use rand::{Rng, SeedableRng};
+        let n = 400;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42);
+        let vecs: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..4).map(|_| rng.gen::<f32>()).collect())
+            .collect();
+        let index = small_degree_index(4, 8);
+        index.add_vectors(&vecs).unwrap();
+
+        // Without the reverse-edge re-prune 392/400 are reachable; with it 397.
+        let results = index.search(&vecs[0], n, n);
+        assert!(results.len() >= 397, "reachable {}/{}", results.len(), n);
     }
 }
